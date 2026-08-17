@@ -49,18 +49,6 @@ def init_db():
         )
     ''')
     
-    # Table to store messages for callback data
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id INTEGER,
-            user_id INTEGER,
-            original_text TEXT,
-            channel_message_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
     # Table for storing text content with unique ID
     c.execute('''
         CREATE TABLE IF NOT EXISTS text_contents (
@@ -106,37 +94,6 @@ def create_or_update_user(user_id: int, is_authorized: bool = False) -> None:
         conn.close()
     except Exception as e:
         logger.exception(f"Error creating/updating user: {e}")
-
-def save_message(message_id: int, user_id: int, original_text: str, channel_message_id: int) -> int:
-    """Save message mapping and return its database ID."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO messages (message_id, user_id, original_text, channel_message_id) "
-            "VALUES (?, ?, ?, ?)",
-            (message_id, user_id, original_text, channel_message_id)
-        )
-        db_id = c.lastrowid
-        conn.commit()
-        conn.close()
-        return db_id
-    except Exception as e:
-        logger.exception(f"Error saving message: {e}")
-        return -1
-
-def get_original_text(db_id: int) -> Optional[str]:
-    """Retrieve original text by database ID."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT original_text FROM messages WHERE id = ?", (db_id,))
-        row = c.fetchone()
-        conn.close()
-        return row[0] if row else None
-    except Exception as e:
-        logger.exception(f"Error getting original text: {e}")
-        return None
 
 def save_text_content(unique_id: str, original_text: str, user_id: int, channel_message_id: int) -> bool:
     """Save text content with unique ID in database."""
@@ -219,7 +176,7 @@ async def is_user_authorized(user_id: int, context: ContextTypes.DEFAULT_TYPE) -
 
 async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> Tuple[int, str]:
     """Send a message to the channel with inline button."""
-    # Channel fixed message with fancy formatting
+    # Channel fixed message with fancy formatting (NO user text here)
     channel_message = (
         "┏━━━━━◥◣◆◢◤━━━━━┓\n"
         "   ᯽ VIP -- ALI ᯽\n"
@@ -244,7 +201,7 @@ async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Failed to save text content for unique_id: {unique_id}")
         raise Exception("Failed to save text content")
     
-    # Create inline keyboard with single button (NO COPY BUTTON)
+    # Create inline keyboard with ONLY ONE button (NO COPY BUTTON)
     keyboard = [[
         InlineKeyboardButton(
             "𝐁𝐈 𝐆𝐇𝐀𝐌",
@@ -308,7 +265,9 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all callback queries."""
     query = update.callback_query
-    await query.answer()
+    # IMPORTANT: Do NOT call query.answer() here
+    # Each handler will call it appropriately
+    
     logger.info(f"Callback received: {query.data} from user: {query.from_user.id}")
     
     # Handle "check_admin" callback
@@ -332,13 +291,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     
     logger.warning(f"Unknown callback: {query.data}")
-    await query.edit_message_text("❌ دستور نامعتبر.")
+    await query.answer("❌ دستور نامعتبر.", show_alert=True)
 
 async def handle_check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle checking if bot is admin in channel."""
     query = update.callback_query
     user_id = update.effective_user.id
     logger.info(f"Check admin from user: {user_id}")
+    
+    # Answer the callback first
+    await query.answer()
     
     is_admin = await check_bot_admin_status(context)
     
@@ -368,6 +330,9 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     logger.info(f"Retry from user: {user_id}")
     
+    # Answer the callback first
+    await query.answer()
+    
     is_admin = await check_bot_admin_status(context)
     
     if is_admin:
@@ -390,9 +355,9 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     callback_data = query.data
     user_id = query.from_user.id
     
-    # LOG: Button clicked
-    logger.info("BUTTON CLICKED")
-    logger.info(f"Callback data: {callback_data}")
+    # ========== LOG: BUTTON CLICK ==========
+    logger.info("========== BUTTON CLICK ==========")
+    logger.info(f"Callback data: {repr(callback_data)}")
     logger.info(f"User ID: {user_id}")
     
     try:
@@ -409,39 +374,40 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         original_text = get_text_content(unique_id)
         logger.info(f"Original text found: {original_text is not None}")
         
-        if original_text:
-            # LOG: Showing text in popup
-            logger.info("Showing original text in Telegram alert")
-            
-            # Check text length limit (Telegram allows max 200 chars for alerts)
-            if len(original_text) > 200:
-                # Truncate text to fit in alert
-                truncated_text = original_text[:197] + "..."
-                await query.answer(
-                    text=f"📝 {truncated_text}\n\n⚠️ متن کامل در پیام کانال موجود است.",
-                    show_alert=True
-                )
-                logger.info(f"Text truncated (was {len(original_text)} chars)")
-            else:
-                # Show full text in popup - THIS IS THE MAIN BEHAVIOR
-                await query.answer(
-                    text=f"📝 {original_text}",
-                    show_alert=True
-                )
-                logger.info(f"Text shown in popup to user {user_id}")
-        else:
-            # LOG: Text not found
-            logger.error("Original text not found")
+        if original_text is None or original_text == "":
+            logger.error("Original text not found or empty")
             await query.answer("❌ متن یافت نشد.", show_alert=True)
+            return
+        
+        logger.info(f"Original text length: {len(original_text)}")
+        logger.info("Showing original text in Telegram alert")
+        
+        # Check text length limit (Telegram allows max 200 chars for alerts)
+        if len(original_text) > 200:
+            # Truncate text to fit in alert
+            truncated_text = original_text[:197] + "..."
+            await query.answer(
+                text=f"📝 {truncated_text}\n\n⚠️ متن کامل در پیام کانال موجود است.",
+                show_alert=True
+            )
+            logger.info(f"Text truncated (was {len(original_text)} chars)")
+        else:
+            # Show full text in popup - THIS IS THE MAIN BEHAVIOR
+            await query.answer(
+                text=original_text,
+                show_alert=True
+            )
+            logger.info("Telegram alert sent successfully")
             
     except Exception as e:
-        logger.exception(f"Error in handle_show_text: {e}")
+        logger.exception("Callback error")
         await query.answer("❌ خطا در نمایش متن.", show_alert=True)
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle cancel button from inline keyboard."""
     query = update.callback_query
     logger.info(f"Cancel from user: {query.from_user.id}")
+    await query.answer()
     await query.edit_message_text(
         "❌ عملیات لغو شد.\n"
         "برای شروع مجدد از /start استفاده کنید."
