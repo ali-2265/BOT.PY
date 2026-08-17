@@ -422,6 +422,19 @@ def main() -> None:
         
         # Start bot
         logger.info("Starting bot...")
+        
+        # IMPORTANT: Create and set event loop for Python 3.14 compatibility
+        import asyncio
+        try:
+            # Try to get existing loop
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            # No event loop exists, create a new one
+            logger.info("No event loop found, creating a new one...")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Run the polling with the event loop
         application.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
