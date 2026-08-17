@@ -14,7 +14,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.constants import ChatType
 from telegram.error import TelegramError
 
 # -------------------- Logging Setup --------------------
@@ -287,21 +286,16 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     callback_data = query.data
     
     try:
-        # Extract database ID from callback data
+        # Extract user ID from callback data
         # Format: show_{user_id}_{timestamp}
         parts = callback_data.split('_')
         if len(parts) < 3:
             await query.answer("❌ داده نامعتبر.", show_alert=True)
             return
         
-        # We'll use the timestamp to find the message
-        # For simplicity, we'll search by user_id and latest message
-        # In production, you'd want to store the mapping properly
-        
         user_id = int(parts[1])
         
         # Get the original text from database
-        # For this simple implementation, we'll get the latest message from this user
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute(
@@ -404,30 +398,35 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # -------------------- Main Application --------------------
 def main() -> None:
     """Start the bot."""
-    # Initialize database
-    init_db()
-    logger.info("Database initialized.")
-    
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    
-    # Add callback query handler
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Add message handlers
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_unknown_message))
-    
-    # Add error handler
-    application.add_error_handler(error_handler)
-    
-    # Start bot
-    logger.info("Starting bot...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        # Initialize database
+        init_db()
+        logger.info("Database initialized.")
+        
+        # Create application
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Add command handlers
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("cancel", cancel_command))
+        
+        # Add callback query handler
+        application.add_handler(CallbackQueryHandler(button_callback))
+        
+        # Add message handlers
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+        application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_unknown_message))
+        
+        # Add error handler
+        application.add_error_handler(error_handler)
+        
+        # Start bot
+        logger.info("Starting bot...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        logger.error(f"Fatal error in main: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
