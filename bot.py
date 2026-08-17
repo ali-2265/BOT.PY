@@ -2,8 +2,9 @@
 import os
 import logging
 import sqlite3
+import uuid
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -29,7 +30,7 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set!")
 
 CHANNEL_USERNAME = "@BI_GH_AM"
-CHANNEL_ID = CHANNEL_USERNAME  # Works with username format for API calls
+CHANNEL_ID = CHANNEL_USERNAME
 
 # -------------------- Database Setup --------------------
 DB_PATH = "bot_data.db"
@@ -56,6 +57,18 @@ def init_db():
             user_id INTEGER,
             original_text TEXT,
             channel_message_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # NEW TABLE: For storing text content with unique ID
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS text_contents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unique_id TEXT NOT NULL UNIQUE,
+            original_text TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            channel_message_id INTEGER NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -109,6 +122,29 @@ def get_original_text(db_id: int) -> Optional[str]:
     conn.close()
     return row[0] if row else None
 
+# NEW FUNCTION: Save text content with unique ID
+def save_text_content(unique_id: str, original_text: str, user_id: int, channel_message_id: int) -> None:
+    """Save text content with unique ID in database."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO text_contents (unique_id, original_text, user_id, channel_message_id) "
+        "VALUES (?, ?, ?, ?)",
+        (unique_id, original_text, user_id, channel_message_id)
+    )
+    conn.commit()
+    conn.close()
+
+# NEW FUNCTION: Get text content by unique ID
+def get_text_content(unique_id: str) -> Optional[str]:
+    """Retrieve original text by unique ID."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT original_text FROM text_contents WHERE unique_id = ?", (unique_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
 # -------------------- Helper Functions --------------------
 async def check_bot_admin_status(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Check if the bot is an administrator in the channel."""
@@ -124,30 +160,31 @@ async def check_bot_admin_status(context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 async def is_user_authorized(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Check if user is authorized to post messages."""
-    # First check if bot is admin in channel
     if not await check_bot_admin_status(context):
         return False
     
-    # Then check user's authorization status
     user = get_user(user_id)
     return user and user["is_authorized"]
 
-async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> Tuple[int, str]:
     """Send a message to the channel with inline button."""
-    # Channel header
-    channel_header = (
-        "VIP ALI\n"
-        "VIP BI GHAM\n"
-        "@BI_GH_AM\n\n"
+    # Channel fixed message with fancy formatting
+    channel_message = (
+        "┏━━━━━◥◣◆◢◤━━━━━┓\n"
+        "   ᯽ VIP -- ALI ᯽\n"
+        "   ᯽ VIP -- BI GHAM ᯽\n"
+        "   ᯽ @BI_GH_AM ᯽\n"
+        "┗━━━━━◥◣◆◢◤━━━━━┛"
     )
     
-    full_text = channel_header + text
+    # Generate unique ID for this text
+    unique_id = str(uuid.uuid4())
     
-    # Create inline keyboard with callback data
+    # Create inline keyboard with the button
     keyboard = [[
         InlineKeyboardButton(
-            "👁 نمایش متن",
-            callback_data=f"show_{update.effective_user.id}_{datetime.now().timestamp()}"
+            "𝐁𝐈 𝐆𝐇𝐀𝐌",
+            callback_data=f"show_{unique_id}"
         )
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -156,10 +193,27 @@ async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         channel_msg = await context.bot.send_message(
             chat_id=CHANNEL_ID,
-            text=full_text,
+            text=channel_message,
             reply_markup=reply_markup
         )
-        return channel_msg.message_id
+        
+        # Save the text content with unique ID
+        save_text_content(
+            unique_id=unique_id,
+            original_text=text,
+            user_id=update.effective_user.id,
+            channel_message_id=channel_msg.message_id
+        )
+        
+        # Also save in old table for backward compatibility
+        save_message(
+            message_id=update.message.message_id,
+            user_id=update.effective_user.id,
+            original_text=text,
+            channel_message_id=channel_msg.message_id
+        )
+        
+        return channel_msg.message_id, unique_id
     except TelegramError as e:
         logger.error(f"Error sending message to channel: {e}")
         raise
@@ -170,7 +224,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     user_id = user.id
     
-    # Create or get user
     create_or_update_user(user_id, False)
     
     welcome_text = (
@@ -196,15 +249,12 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "❌ عملیات لغو شد.\n"
         "برای شروع مجدد از /start استفاده کنید."
     )
-    # Clear any user data if needed
     context.user_data.clear()
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all callback queries."""
     query = update.callback_query
-    await query.answer()  # Always answer callback to avoid timeout
-    
-    user_id = update.effective_user.id
+    await query.answer()
     
     # Handle "check_admin" callback
     if query.data == "check_admin":
@@ -226,7 +276,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await handle_cancel(update, context)
         return
     
-    # Unknown callback
     await query.edit_message_text("❌ دستور نامعتبر.")
 
 async def handle_check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -234,11 +283,9 @@ async def handle_check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     user_id = update.effective_user.id
     
-    # Check if bot is admin
     is_admin = await check_bot_admin_status(context)
     
     if is_admin:
-        # Update user as authorized
         create_or_update_user(user_id, True)
         
         await query.edit_message_text(
@@ -246,7 +293,6 @@ async def handle_check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "حالا متن موردنظر خود را ارسال کنید."
         )
     else:
-        # Create retry button
         keyboard = [[
             InlineKeyboardButton("🔄 بررسی مجدد", callback_data="retry")
         ]]
@@ -263,11 +309,9 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     user_id = update.effective_user.id
     
-    # Check if bot is admin
     is_admin = await check_bot_admin_status(context)
     
     if is_admin:
-        # Update user as authorized
         create_or_update_user(user_id, True)
         
         await query.edit_message_text(
@@ -286,32 +330,21 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     callback_data = query.data
     
     try:
-        # Extract user ID from callback data
-        # Format: show_{user_id}_{timestamp}
-        parts = callback_data.split('_')
-        if len(parts) < 3:
-            await query.answer("❌ داده نامعتبر.", show_alert=True)
+        if not callback_data.startswith("show_"):
+            await query.answer("❌ دستور نامعتبر.", show_alert=True)
             return
         
-        user_id = int(parts[1])
+        unique_id = callback_data[5:]  # Remove "show_" prefix
         
-        # Get the original text from database
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "SELECT original_text FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-            (user_id,)
-        )
-        row = c.fetchone()
-        conn.close()
+        original_text = get_text_content(unique_id)
         
-        if row and row[0]:
-            await query.answer(f"📝 متن اصلی:\n\n{row[0]}", show_alert=True)
+        if original_text:
+            await query.answer(f"📝 {original_text}", show_alert=True)
         else:
             await query.answer("❌ متن یافت نشد.", show_alert=True)
             
-    except (ValueError, IndexError) as e:
-        logger.error(f"Error parsing callback data: {e}")
+    except Exception as e:
+        logger.error(f"Error in handle_show_text: {e}")
         await query.answer("❌ خطا در نمایش متن.", show_alert=True)
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -327,9 +360,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
     text = update.message.text
     
-    # Check if user is authorized
     if not await is_user_authorized(user_id, context):
-        # Check if bot is admin
         if not await check_bot_admin_status(context):
             keyboard = [[
                 InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
@@ -341,7 +372,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=reply_markup
             )
         else:
-            # User not authorized
             keyboard = [[
                 InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
             ]]
@@ -354,16 +384,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     try:
-        # Send message to channel
-        channel_msg_id = await send_channel_message(update, context, text)
-        
-        # Save message mapping
-        save_message(
-            message_id=update.message.message_id,
-            user_id=user_id,
-            original_text=text,
-            channel_message_id=channel_msg_id
-        )
+        channel_msg_id, unique_id = await send_channel_message(update, context, text)
         
         await update.message.reply_text(
             "✅ متن شما با موفقیت در کانال منتشر شد.\n"
@@ -377,7 +398,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle non-text messages (photos, videos, etc.)."""
+    """Handle non-text messages."""
     await update.message.reply_text(
         "❌ لطفاً فقط متن ارسال کنید.\n"
         "ربات فعلاً فقط از ارسال متن پشتیبانی می‌کند."
@@ -399,42 +420,29 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def main() -> None:
     """Start the bot."""
     try:
-        # Initialize database
         init_db()
         logger.info("Database initialized.")
         
-        # Create application
         application = Application.builder().token(BOT_TOKEN).build()
         
-        # Add command handlers
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("cancel", cancel_command))
-        
-        # Add callback query handler
         application.add_handler(CallbackQueryHandler(button_callback))
-        
-        # Add message handlers
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
         application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_unknown_message))
-        
-        # Add error handler
         application.add_error_handler(error_handler)
         
-        # Start bot
         logger.info("Starting bot...")
         
-        # IMPORTANT: Create and set event loop for Python 3.14 compatibility
+        # Event loop handling for Python 3.14
         import asyncio
         try:
-            # Try to get existing loop
             loop = asyncio.get_event_loop()
         except RuntimeError:
-            # No event loop exists, create a new one
             logger.info("No event loop found, creating a new one...")
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
         
-        # Run the polling with the event loop
         application.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
