@@ -175,6 +175,23 @@ def get_text_content(unique_id: str) -> Optional[str]:
         logger.exception(f"Database error in get_text_content: {e}")
         return None
 
+def update_channel_message_id(unique_id: str, channel_message_id: int) -> bool:
+    """Update channel_message_id for a given unique_id."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "UPDATE text_contents SET channel_message_id = ? WHERE unique_id = ?",
+            (channel_message_id, unique_id)
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"Updated channel_message_id for unique_id: {unique_id}")
+        return True
+    except Exception as e:
+        logger.exception(f"Error updating channel_message_id: {e}")
+        return False
+
 # -------------------- Helper Functions --------------------
 async def check_bot_admin_status(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Check if the bot is an administrator in the channel."""
@@ -201,7 +218,7 @@ async def is_user_authorized(user_id: int, context: ContextTypes.DEFAULT_TYPE) -
     return is_auth
 
 async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> Tuple[int, str]:
-    """Send a message to the channel with inline button."""
+    """Send a message to the channel with inline buttons."""
     # Channel fixed message with fancy formatting
     channel_message = (
         "┏━━━━━◥◣◆◢◤━━━━━┓\n"
@@ -215,13 +232,31 @@ async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYP
     unique_id = str(uuid.uuid4())
     logger.info(f"Generated unique_id: {unique_id}")
     
-    # Create inline keyboard with the button
-    keyboard = [[
-        InlineKeyboardButton(
-            "𝐁𝐈 𝐆𝐇𝐀𝐌",
-            callback_data=f"show_{unique_id}"
-        )
-    ]]
+    # Save text to database before creating buttons
+    save_success = save_text_content(
+        unique_id=unique_id,
+        original_text=text,
+        user_id=update.effective_user.id,
+        channel_message_id=0  # Will be updated after sending
+    )
+    
+    if not save_success:
+        logger.error(f"Failed to save text content for unique_id: {unique_id}")
+        raise Exception("Failed to save text content")
+    
+    # Create inline keyboard with two buttons
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "𝐁𝐈 𝐆𝐇𝐀𝐌",
+                callback_data=f"show_{unique_id}"
+            ),
+            InlineKeyboardButton(
+                "📋 کپی",
+                callback_data=f"copy_{unique_id}"
+            )
+        ]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     # Send message to channel
@@ -233,24 +268,8 @@ async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         logger.info(f"Channel message sent: {channel_msg.message_id}")
         
-        # Save the text content with unique ID
-        save_success = save_text_content(
-            unique_id=unique_id,
-            original_text=text,
-            user_id=update.effective_user.id,
-            channel_message_id=channel_msg.message_id
-        )
-        
-        if not save_success:
-            logger.error(f"Failed to save text content for unique_id: {unique_id}")
-        
-        # Also save in old table for backward compatibility
-        save_message(
-            message_id=update.message.message_id,
-            user_id=update.effective_user.id,
-            original_text=text,
-            channel_message_id=channel_msg.message_id
-        )
+        # Update channel_message_id in database
+        update_channel_message_id(unique_id, channel_msg.message_id)
         
         return channel_msg.message_id, unique_id
     except TelegramError as e:
@@ -306,6 +325,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Handle "show_text" callback
     if query.data.startswith("show_"):
         await handle_show_text(update, context)
+        return
+    
+    # Handle "copy_text" callback
+    if query.data.startswith("copy_"):
+        await handle_copy_text(update, context)
         return
     
     # Handle "retry" callback
@@ -380,33 +404,32 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     logger.info(f"Show text callback from user: {user_id}, data: {callback_data}")
     
     try:
-        # Check if callback data starts with "show_"
         if not callback_data.startswith("show_"):
             logger.warning(f"Invalid callback format: {callback_data}")
             await query.answer("❌ دستور نامعتبر.", show_alert=True)
             return
         
-        # Extract unique ID from callback data
-        unique_id = callback_data[5:]  # Remove "show_" prefix
+        unique_id = callback_data[5:]
         logger.info(f"Extracted unique_id: {unique_id}")
         
-        # Get the original text from database using unique ID
         original_text = get_text_content(unique_id)
         logger.info(f"Text found: {original_text is not None}")
         
         if original_text:
-            # Send the text as a private message to the user who clicked
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"📝 متن اصلی:\n\n{original_text}",
-                    parse_mode=None  # Plain text, no formatting
+            # Show text as popup alert (no new message sent)
+            if len(original_text) > 200:
+                truncated_text = original_text[:197] + "..."
+                await query.answer(
+                    text=f"📝 {truncated_text}\n\n⚠️ متن کامل در دکمه کپی موجود است.",
+                    show_alert=True
                 )
-                await query.answer("✅ متن ارسال شد.", show_alert=False)
-                logger.info(f"Text sent to user {user_id}")
-            except TelegramError as e:
-                logger.error(f"Failed to send message to user {user_id}: {e}")
-                await query.answer("❌ خطا در ارسال متن.", show_alert=True)
+                logger.info(f"Text truncated (was {len(original_text)} chars)")
+            else:
+                await query.answer(
+                    text=f"📝 {original_text}",
+                    show_alert=True
+                )
+                logger.info(f"Text shown in popup to user {user_id}")
         else:
             logger.warning(f"No text found for unique_id: {unique_id}")
             await query.answer("❌ متن یافت نشد.", show_alert=True)
@@ -414,6 +437,41 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception as e:
         logger.exception(f"Error in handle_show_text: {e}")
         await query.answer("❌ خطا در نمایش متن.", show_alert=True)
+
+async def handle_copy_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle copy text button click."""
+    query = update.callback_query
+    callback_data = query.data
+    user_id = query.from_user.id
+    
+    logger.info(f"Copy text callback from user: {user_id}, data: {callback_data}")
+    
+    try:
+        if not callback_data.startswith("copy_"):
+            logger.warning(f"Invalid callback format: {callback_data}")
+            await query.answer("❌ دستور نامعتبر.", show_alert=True)
+            return
+        
+        unique_id = callback_data[5:]
+        logger.info(f"Extracted unique_id for copy: {unique_id}")
+        
+        original_text = get_text_content(unique_id)
+        logger.info(f"Text found for copy: {original_text is not None}")
+        
+        if original_text:
+            # Show text in popup with copy instruction
+            await query.answer(
+                text=f"📋 متن برای کپی:\n\n{original_text}\n\n👇 لطفاً متن را کپی کنید",
+                show_alert=True
+            )
+            logger.info(f"Copy text shown to user {user_id}")
+        else:
+            logger.warning(f"No text found for copy unique_id: {unique_id}")
+            await query.answer("❌ متن یافت نشد.", show_alert=True)
+            
+    except Exception as e:
+        logger.exception(f"Error in handle_copy_text: {e}")
+        await query.answer("❌ خطا در کپی متن.", show_alert=True)
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle cancel button from inline keyboard."""
