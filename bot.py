@@ -244,7 +244,7 @@ async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Failed to save text content for unique_id: {unique_id}")
         raise Exception("Failed to save text content")
     
-    # Create inline keyboard with single button
+    # Create inline keyboard with single button (NO COPY BUTTON)
     keyboard = [[
         InlineKeyboardButton(
             "𝐁𝐈 𝐆𝐇𝐀𝐌",
@@ -316,7 +316,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await handle_check_admin(update, context)
         return
     
-    # Handle "show_text" callback
+    # Handle "show_text" callback (this is our main button)
     if query.data.startswith("show_"):
         await handle_show_text(update, context)
         return
@@ -390,7 +390,10 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     callback_data = query.data
     user_id = query.from_user.id
     
-    logger.info(f"Show text callback from user: {user_id}, data: {callback_data}")
+    # LOG: Button clicked
+    logger.info("BUTTON CLICKED")
+    logger.info(f"Callback data: {callback_data}")
+    logger.info(f"User ID: {user_id}")
     
     try:
         if not callback_data.startswith("show_"):
@@ -398,17 +401,21 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("❌ دستور نامعتبر.", show_alert=True)
             return
         
-        unique_id = callback_data[5:]
-        logger.info(f"Extracted unique_id: {unique_id}")
+        # Extract unique ID from callback data
+        unique_id = callback_data[5:]  # Remove "show_" prefix
+        logger.info(f"Text ID: {unique_id}")
         
+        # Get the original text from database
         original_text = get_text_content(unique_id)
-        logger.info(f"Text found: {original_text is not None}")
+        logger.info(f"Original text found: {original_text is not None}")
         
         if original_text:
-            # Check text length limit for callback alert
-            # Telegram limits alert text to 200 characters
+            # LOG: Showing text in popup
+            logger.info("Showing original text in Telegram alert")
+            
+            # Check text length limit (Telegram allows max 200 chars for alerts)
             if len(original_text) > 200:
-                # Truncate and notify user
+                # Truncate text to fit in alert
                 truncated_text = original_text[:197] + "..."
                 await query.answer(
                     text=f"📝 {truncated_text}\n\n⚠️ متن کامل در پیام کانال موجود است.",
@@ -416,14 +423,15 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
                 logger.info(f"Text truncated (was {len(original_text)} chars)")
             else:
-                # Show full text in popup
+                # Show full text in popup - THIS IS THE MAIN BEHAVIOR
                 await query.answer(
                     text=f"📝 {original_text}",
                     show_alert=True
                 )
                 logger.info(f"Text shown in popup to user {user_id}")
         else:
-            logger.warning(f"No text found for unique_id: {unique_id}")
+            # LOG: Text not found
+            logger.error("Original text not found")
             await query.answer("❌ متن یافت نشد.", show_alert=True)
             
     except Exception as e:
