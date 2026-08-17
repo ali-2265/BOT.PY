@@ -229,50 +229,104 @@ async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # -------------------- Handlers --------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command."""
+    """Handle /start command - Check bot admin status and show appropriate menu."""
     user = update.effective_user
     user_id = user.id
     logger.info(f"Start command from user: {user_id}")
     
-    create_or_update_user(user_id, False)
+    # Check if bot is admin in channel
+    is_admin = await check_bot_admin_status(context)
     
-    welcome_text = (
-        f"👋 سلام {user.first_name}!\n\n"
-        "به ربات پست‌گذار کانال خوش آمدید.\n"
-        "برای استفاده از این ربات، ابتدا باید ربات را در کانال ادمین کنید.\n\n"
-        "کانال: @BI_GH_AM"
-    )
-    
-    keyboard = [[
-        InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        welcome_text,
-        reply_markup=reply_markup
-    )
+    if is_admin:
+        # Bot is admin - show main menu
+        logger.info(f"Bot is admin, showing main menu to user {user_id}")
+        
+        # Update user as authorized
+        create_or_update_user(user_id, True)
+        
+        welcome_text = (
+            f"👋 سلام {user.first_name}!\n\n"
+            "ربات آماده است.\n"
+            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
+        )
+        
+        keyboard = [[
+            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=reply_markup
+        )
+    else:
+        # Bot is not admin - ask user to add bot as admin
+        logger.info(f"Bot is not admin, asking user {user_id} to add bot as admin")
+        
+        create_or_update_user(user_id, False)
+        
+        welcome_text = (
+            f"👋 سلام {user.first_name}!\n\n"
+            "❌ برای استفاده از ربات، ابتدا باید ربات را در کانال @BI_GH_AM به عنوان Administrator اضافه کنید."
+        )
+        
+        keyboard = [[
+            InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=reply_markup
+        )
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /cancel command."""
-    logger.info(f"Cancel command from user: {update.effective_user.id}")
-    await update.message.reply_text(
-        "❌ عملیات لغو شد.\n"
-        "برای شروع مجدد از /start استفاده کنید."
-    )
+    user_id = update.effective_user.id
+    logger.info(f"Cancel command from user: {user_id}")
+    
+    # Clear any user state
     context.user_data.clear()
+    
+    # Check if bot is admin
+    is_admin = await check_bot_admin_status(context)
+    
+    if is_admin:
+        # Show main menu
+        welcome_text = (
+            f"👋 سلام {update.effective_user.first_name}!\n\n"
+            "ربات آماده است.\n"
+            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
+        )
+        
+        keyboard = [[
+            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "❌ ارسال متن لغو شد.\n\n" + welcome_text,
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            "❌ عملیات لغو شد.\n"
+            "برای شروع مجدد از /start استفاده کنید."
+        )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all callback queries."""
     query = update.callback_query
-    # IMPORTANT: Do NOT call query.answer() here
-    # Each handler will call it appropriately
-    
     logger.info(f"Callback received: {query.data} from user: {query.from_user.id}")
     
     # Handle "check_admin" callback
     if query.data == "check_admin":
         await handle_check_admin(update, context)
+        return
+    
+    # Handle "send_text" callback
+    if query.data == "send_text":
+        await handle_send_text(update, context)
         return
     
     # Handle "show_text" callback (this is our main button)
@@ -305,22 +359,35 @@ async def handle_check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE)
     is_admin = await check_bot_admin_status(context)
     
     if is_admin:
+        # Bot is admin - authorize user and show main menu
         create_or_update_user(user_id, True)
         logger.info(f"User {user_id} authorized as admin")
         
+        welcome_text = (
+            "✅ تأیید شد.\n\n"
+            "ربات آماده استفاده است.\n"
+            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
+        )
+        
+        keyboard = [[
+            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await query.edit_message_text(
-            "✅ ربات با موفقیت ادمین شد.\n"
-            "حالا متن موردنظر خود را ارسال کنید."
+            welcome_text,
+            reply_markup=reply_markup
         )
     else:
+        # Bot is still not admin
         keyboard = [[
             InlineKeyboardButton("🔄 بررسی مجدد", callback_data="retry")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            "❌ هنوز ربات را ادمین نکرده‌اید.\n"
-            "ابتدا ربات را در کانال ادمین کنید و دوباره روی دکمه بزنید.",
+            "❌ ربات هنوز Administrator نشده است.\n"
+            "لطفاً ابتدا آن را در کانال ادمین کنید و دوباره تلاش کنید.",
             reply_markup=reply_markup
         )
 
@@ -336,18 +403,70 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     is_admin = await check_bot_admin_status(context)
     
     if is_admin:
+        # Bot is admin - authorize user and show main menu
         create_or_update_user(user_id, True)
         logger.info(f"User {user_id} authorized via retry")
         
+        welcome_text = (
+            "✅ تأیید شد.\n\n"
+            "ربات آماده استفاده است.\n"
+            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
+        )
+        
+        keyboard = [[
+            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await query.edit_message_text(
-            "✅ ربات با موفقیت ادمین شد.\n"
-            "حالا متن موردنظر خود را ارسال کنید."
+            welcome_text,
+            reply_markup=reply_markup
         )
     else:
         await query.edit_message_text(
-            "❌ همچنان ربات ادمین نیست.\n"
+            "❌ ربات همچنان Administrator نیست.\n"
             "لطفاً ابتدا ربات را در کانال ادمین کنید."
         )
+
+async def handle_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle send text button click - Enter text receiving mode."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    logger.info(f"Send text from user: {user_id}")
+    
+    # Answer the callback first
+    await query.answer()
+    
+    # Double check if bot is still admin
+    is_admin = await check_bot_admin_status(context)
+    
+    if not is_admin:
+        # Bot is no longer admin - show error
+        logger.warning(f"Bot is no longer admin when user {user_id} tried to send text")
+        
+        welcome_text = (
+            "❌ ربات دیگر Administrator نیست.\n"
+            "لطفاً مجدداً ربات را در کانال ادمین کنید."
+        )
+        
+        keyboard = [[
+            InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            welcome_text,
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Bot is admin - enter text receiving mode
+    # Set user state to waiting for text
+    context.user_data['waiting_for_text'] = True
+    
+    await query.edit_message_text(
+        "📝 لطفاً متن موردنظر خود را ارسال کنید."
+    )
 
 async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle showing original text in popup when button is clicked."""
@@ -419,8 +538,62 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text
     logger.info(f"Text message from user: {user_id}, text: {text[:50]}...")
     
-    # Check if user is authorized
+    # Check if user is in text receiving mode
+    if context.user_data.get('waiting_for_text'):
+        logger.info(f"User {user_id} is in text receiving mode")
+        
+        # Check if bot is still admin
+        if not await check_bot_admin_status(context):
+            # Bot is no longer admin
+            context.user_data['waiting_for_text'] = False
+            keyboard = [[
+                InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "❌ ربات دیگر Administrator نیست.\n"
+                "لطفاً مجدداً ربات را در کانال ادمین کنید.",
+                reply_markup=reply_markup
+            )
+            return
+        
+        # Try to send message to channel
+        try:
+            # Send message to channel
+            channel_msg_id, unique_id = await send_channel_message(update, context, text)
+            logger.info(f"Message sent to channel: {channel_msg_id}, unique_id: {unique_id}")
+            
+            # Clear text receiving mode
+            context.user_data['waiting_for_text'] = False
+            
+            # Show success message with main menu
+            success_text = (
+                "✅ متن شما با موفقیت در کانال منتشر شد.\n\n"
+                "برای ارسال متن جدید، روی دکمه زیر بزنید."
+            )
+            
+            keyboard = [[
+                InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                success_text,
+                reply_markup=reply_markup
+            )
+            
+        except TelegramError as e:
+            logger.error(f"Error sending message: {e}")
+            context.user_data['waiting_for_text'] = False
+            await update.message.reply_text(
+                f"❌ خطا در ارسال پیام به کانال: {str(e)}"
+            )
+        
+        return
+    
+    # If user is not in text receiving mode, check authorization
     if not await is_user_authorized(user_id, context):
+        # Check if bot is admin
         if not await check_bot_admin_status(context):
             keyboard = [[
                 InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
@@ -432,32 +605,22 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=reply_markup
             )
         else:
+            # User not authorized but bot is admin - show main menu
+            create_or_update_user(user_id, True)
+            welcome_text = (
+                f"👋 سلام {update.effective_user.first_name}!\n\n"
+                "ربات آماده است.\n"
+                "برای ارسال متن به کانال، روی دکمه زیر بزنید."
+            )
             keyboard = [[
-                InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
+                InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
             ]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
-                "❌ شما هنوز تأیید نشده‌اید.\n"
-                "لطفاً روی دکمه زیر کلیک کنید تا دسترسی شما تأیید شود:",
+                welcome_text,
                 reply_markup=reply_markup
             )
         return
-    
-    try:
-        # Send message to channel
-        channel_msg_id, unique_id = await send_channel_message(update, context, text)
-        logger.info(f"Message sent to channel: {channel_msg_id}, unique_id: {unique_id}")
-        
-        await update.message.reply_text(
-            "✅ متن شما با موفقیت در کانال منتشر شد.\n"
-            "برای ارسال متن جدید، کافیست متن را ارسال کنید."
-        )
-        
-    except TelegramError as e:
-        logger.error(f"Error sending message: {e}")
-        await update.message.reply_text(
-            f"❌ خطا در ارسال پیام به کانال: {str(e)}"
-        )
 
 async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle non-text messages."""
