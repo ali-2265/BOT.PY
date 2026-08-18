@@ -222,12 +222,10 @@ async def start_web_server():
     """Start aiohttp web server."""
     app = web.Application()
     
-    # Static files for webapp
     app.router.add_get('/webapp/', handle_webapp)
     app.router.add_get('/webapp/{path:.*}', handle_webapp)
     app.router.add_get('/', handle_webapp)
     
-    # API endpoint
     app.router.add_post('/api/text', handle_api_text)
     
     runner = web.AppRunner(app)
@@ -269,7 +267,6 @@ async def send_channel_message(
     media_file_id: Optional[str] = None
 ) -> Tuple[int, str]:
     """Send a message to the channel with inline button."""
-    # Channel header
     channel_header = (
         "┏━━━━━◥◣◆◢◤━━━━━┓\n"
         "   ᯽ VIP -- ALI ᯽\n"
@@ -278,11 +275,9 @@ async def send_channel_message(
         "┗━━━━━◥◣◆◢◤━━━━━┛"
     )
     
-    # Generate unique ID for this text
     unique_id = str(uuid.uuid4())
     logger.info(f"Generated unique_id: {unique_id}")
     
-    # Create inline keyboard with Web App button
     webapp_url = f"{WEBAPP_URL}?text_id={unique_id}"
     keyboard = [[
         InlineKeyboardButton(
@@ -292,7 +287,6 @@ async def send_channel_message(
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Send message to channel based on media type
     try:
         logger.info(f"Sending channel message with media_type: {media_type}")
         
@@ -318,7 +312,6 @@ async def send_channel_message(
                 reply_markup=reply_markup
             )
         else:
-            # Text only
             full_text = channel_header + "\n\n" + text
             channel_msg = await context.bot.send_message(
                 chat_id=CHANNEL_ID,
@@ -328,7 +321,6 @@ async def send_channel_message(
         
         logger.info(f"Channel message sent successfully: {channel_msg.message_id}")
         
-        # Save text to database
         save_success = await save_text_content(
             unique_id=unique_id,
             original_text=text,
@@ -548,7 +540,6 @@ async def handle_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
     
-    # Clear any previous pending data
     context.user_data.clear()
     context.user_data['waiting_for_text'] = True
     context.user_data['media_type'] = None
@@ -582,7 +573,6 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
     logger.info(f"Media received from user: {user_id}")
     
     if not context.user_data.get('waiting_for_text'):
-        # User is not in content receiving mode
         if await is_user_authorized(user_id, context):
             welcome_text = (
                 f"👋 سلام {update.effective_user.first_name}!\n\n"
@@ -598,19 +588,18 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
     media_type = None
     media_file_id = None
     
-    # Detect media type
     if update.message.photo:
         media_type = "photo"
         media_file_id = update.message.photo[-1].file_id
-        logger.info(f"Photo received, file_id: {media_file_id[:20]}...")
+        logger.info(f"Photo received")
     elif update.message.video:
         media_type = "video"
         media_file_id = update.message.video.file_id
-        logger.info(f"Video received, file_id: {media_file_id[:20]}...")
+        logger.info(f"Video received")
     elif update.message.voice:
         media_type = "voice"
         media_file_id = update.message.voice.file_id
-        logger.info(f"Voice received, file_id: {media_file_id[:20]}...")
+        logger.info(f"Voice received")
     else:
         await update.message.reply_text(
             "❌ نوع فایل پشتیبانی نمی‌شود.\n"
@@ -618,7 +607,6 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
     
-    # Store media in user_data
     context.user_data['media_type'] = media_type
     context.user_data['media_file_id'] = media_file_id
     
@@ -638,7 +626,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     if context.user_data.get('waiting_for_text'):
         logger.info(f"User {user_id} is in content receiving mode")
-        logger.info(f"Text received: {text[:50]}...")
         
         if not await check_bot_admin_status(context):
             context.user_data.clear()
@@ -654,18 +641,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         
         try:
-            # Get pending media info
             media_type = context.user_data.get('media_type')
             media_file_id = context.user_data.get('media_file_id')
             
-            # Send message to channel
             logger.info(f"Sending to channel with media_type: {media_type}")
             channel_msg_id, unique_id = await send_channel_message(
                 update, context, text, media_type, media_file_id
             )
-            logger.info(f"Message sent to channel successfully: {channel_msg_id}, unique_id: {unique_id}")
+            logger.info(f"Message sent to channel successfully: {channel_msg_id}")
             
-            # Clear user data
             context.user_data.clear()
             
             success_text = (
@@ -692,7 +676,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         return
     
-    # If user is not in content receiving mode
     if not await is_user_authorized(user_id, context):
         if not await check_bot_admin_status(context):
             keyboard = [[
@@ -744,26 +727,20 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def main() -> None:
     """Start the bot and web server."""
     try:
-        # Initialize database
         await init_db_pool()
         
-        # Start web server
         await start_web_server()
         
-        # Create application
         application = Application.builder().token(BOT_TOKEN).build()
         logger.info("Application created successfully.")
         
-        # Add command handlers
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("cancel", cancel_command))
         logger.info("Command handlers added.")
         
-        # Add callback query handler
         application.add_handler(CallbackQueryHandler(button_callback))
         logger.info("Callback handler added.")
         
-        # Add message handlers
         application.add_handler(MessageHandler(filters.PHOTO, handle_media_message))
         application.add_handler(MessageHandler(filters.VIDEO, handle_media_message))
         application.add_handler(MessageHandler(filters.VOICE, handle_media_message))
@@ -771,20 +748,17 @@ async def main() -> None:
         application.add_handler(MessageHandler(~filters.TEXT & ~filters.PHOTO & ~filters.VIDEO & ~filters.VOICE, handle_unknown_message))
         logger.info("Message handlers added.")
         
-        # Add error handler
         application.add_error_handler(error_handler)
         logger.info("Error handler added.")
         
         logger.info("Starting bot...")
         
-        # Start polling
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
         
         logger.info("Bot is running. Press Ctrl+C to stop.")
         
-        # Keep the bot running
         try:
             while True:
                 await asyncio.sleep(1)
