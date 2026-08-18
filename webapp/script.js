@@ -14,7 +14,7 @@ const copySuccess = document.getElementById('copySuccess');
 // Show loading state
 textBody.innerHTML = '<div class="loading-text">⏳ در حال بارگذاری...</div>';
 
-// Function to fetch text from database via API
+// Function to fetch text from database via Telegram
 async function fetchText() {
     if (!textId) {
         textBody.innerHTML = '<div class="error-text">❌ خطا: شناسه متن یافت نشد.</div>';
@@ -22,27 +22,14 @@ async function fetchText() {
     }
 
     try {
-        // Send request to bot through Telegram Web App
-        tg.sendData(JSON.stringify({
+        // Send data to bot through Telegram Web App
+        const data = JSON.stringify({
             action: 'get_text',
             text_id: textId
-        }));
-
-        // Store callback for bot response
-        window._pendingCallback = function(response) {
-            try {
-                const data = JSON.parse(response);
-                if (data.text) {
-                    displayText(data.text);
-                } else if (data.error) {
-                    textBody.innerHTML = '<div class="error-text">❌ ' + data.error + '</div>';
-                }
-            } catch (e) {
-                console.error('Error parsing response:', e);
-                textBody.innerHTML = '<div class="error-text">❌ خطا در نمایش متن.</div>';
-            }
-        };
-
+        });
+        
+        tg.sendData(data);
+        
     } catch (error) {
         console.error('Error fetching text:', error);
         textBody.innerHTML = '<div class="error-text">❌ خطا در دریافت متن.</div>';
@@ -93,6 +80,11 @@ copyBtn.addEventListener('click', function() {
 // OK button handler - close popup
 okBtn.addEventListener('click', function() {
     tg.close();
+});
+
+// Handle data from bot
+tg.onEvent('mainButtonClicked', function() {
+    // Handle main button if needed
 });
 
 // Initialize - request text from bot
