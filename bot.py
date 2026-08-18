@@ -290,8 +290,6 @@ async def send_channel_message(
         logger.error(f"Failed to save text content for unique_id: {unique_id}")
         raise Exception("Failed to save text content")
     
-    # ========== اصلاح: استفاده از callback_data به جای web_app ==========
-    # چون دکمه web_app در کانال پشتیبانی نمی‌شود
     keyboard = [[
         InlineKeyboardButton(
             "𝐁𝐈 𝐆𝐇𝐀𝐌",
@@ -299,9 +297,7 @@ async def send_channel_message(
         )
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    # ==================================================================
     
-    # Send message to channel based on media type
     try:
         logger.info(f"Sending channel message with media_type: {media_type}")
         
@@ -327,12 +323,14 @@ async def send_channel_message(
                 reply_markup=reply_markup
             )
         else:
-            full_text = channel_header + "\n\n" + text
+            # ========== اصلاح: فقط متن کاربر، بدون Header ==========
+            # Text only - send only the user's text without the header
             channel_msg = await context.bot.send_message(
                 chat_id=CHANNEL_ID,
-                text=full_text,
+                text=text,  # فقط متن کاربر
                 reply_markup=reply_markup
             )
+            # ========================================================
         
         logger.info(f"Channel message sent successfully: {channel_msg.message_id}")
         
