@@ -5,7 +5,9 @@ import uuid
 import json
 import asyncpg
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
+from aiohttp import web, web_request, web_response
+import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
@@ -34,7 +36,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable not set!")
 
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-app.onrender.com/webapp/")
+WEBAPP_URL = os.getenv("WEBAPP_URL")
+if not WEBAPP_URL:
+    raise ValueError("WEBAPP_URL environment variable not set!")
+
+PORT = int(os.getenv("PORT", "10000"))
 CHANNEL_USERNAME = "@BI_GH_AM"
 CHANNEL_ID = CHANNEL_USERNAME
 
@@ -48,7 +54,6 @@ async def init_db_pool():
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         logger.info("Database connected successfully.")
         
-        # Create tables if they don't exist
         async with db_pool.acquire() as conn:
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (
@@ -64,6 +69,8 @@ async def init_db_pool():
                     unique_id TEXT UNIQUE NOT NULL,
                     original_text TEXT NOT NULL,
                     user_id BIGINT NOT NULL,
+                    media_type TEXT,
+                    media_file_id TEXT,
                     channel_message_id BIGINT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -111,34 +118,46 @@ async def create_or_update_user(user_id: int, is_authorized: bool = False) -> No
     except Exception as e:
         logger.exception(f"Error creating/updating user: {e}")
 
-async def save_text_content(unique_id: str, original_text: str, user_id: int, channel_message_id: int) -> bool:
+async def save_text_content(
+    unique_id: str,
+    original_text: str,
+    user_id: int,
+    channel_message_id: int,
+    media_type: Optional[str] = None,
+    media_file_id: Optional[str] = None
+) -> bool:
     """Save text content with unique ID in database."""
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO text_contents (unique_id, original_text, user_id, channel_message_id) "
-                "VALUES ($1, $2, $3, $4)",
-                unique_id, original_text, user_id, channel_message_id
+                """INSERT INTO text_contents 
+                   (unique_id, original_text, user_id, channel_message_id, media_type, media_file_id) 
+                   VALUES ($1, $2, $3, $4, $5, $6)""",
+                unique_id, original_text, user_id, channel_message_id, media_type, media_file_id
             )
-            logger.info(f"Text saved with unique_id: {unique_id}")
+            logger.info(f"Text saved with unique_id: {unique_id}, media_type: {media_type}")
             return True
     except Exception as e:
         logger.exception(f"Error saving text content: {e}")
         return False
 
-async def get_text_content(unique_id: str) -> Optional[str]:
-    """Retrieve original text by unique ID."""
+async def get_text_content(unique_id: str) -> Optional[Dict]:
+    """Retrieve original text and media info by unique ID."""
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT original_text FROM text_contents WHERE unique_id = $1",
+                "SELECT original_text, media_type, media_file_id FROM text_contents WHERE unique_id = $1",
                 unique_id
             )
             if row:
                 logger.info(f"Text found in database for ID: {unique_id}")
-                return row[0]
+                return {
+                    "original_text": row[0],
+                    "media_type": row[1],
+                    "media_file_id": row[2]
+                }
             else:
                 logger.warning(f"No text found in database for ID: {unique_id}")
                 return None
@@ -160,6 +179,62 @@ async def update_channel_message_id(unique_id: str, channel_message_id: int) -> 
     except Exception as e:
         logger.exception(f"Error updating channel_message_id: {e}")
         return False
+
+# -------------------- Web Server --------------------
+async def handle_webapp(request: web.Request) -> web.Response:
+    """Serve webapp files."""
+    path = request.path
+    if path == "/" or path == "/webapp/":
+        path = "/webapp/index.html"
+    elif not path.startswith("/webapp/"):
+        path = f"/webapp/{path.lstrip('/')}"
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(base_dir, path.lstrip('/'))
+    
+    if os.path.exists(file_path) and os.path.isfile(file_path):
+        return web.FileResponse(file_path)
+    else:
+        return web.Response(status=404, text="Not Found")
+
+async def handle_api_text(request: web.Request) -> web.Response:
+    """API endpoint for Web App to get text by ID."""
+    try:
+        data = await request.json()
+        text_id = data.get('text_id')
+        
+        if not text_id:
+            return web.json_response({"success": False, "error": "Missing text_id"})
+        
+        text_data = await get_text_content(text_id)
+        if text_data and text_data["original_text"]:
+            return web.json_response({
+                "success": True,
+                "text": text_data["original_text"]
+            })
+        else:
+            return web.json_response({"success": False, "error": "Text not found"})
+    except Exception as e:
+        logger.exception(f"API error: {e}")
+        return web.json_response({"success": False, "error": str(e)})
+
+async def start_web_server():
+    """Start aiohttp web server."""
+    app = web.Application()
+    
+    # Static files for webapp
+    app.router.add_get('/webapp/', handle_webapp)
+    app.router.add_get('/webapp/{path:.*}', handle_webapp)
+    app.router.add_get('/', handle_webapp)
+    
+    # API endpoint
+    app.router.add_post('/api/text', handle_api_text)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"Web server started on port {PORT}")
 
 # -------------------- Helper Functions --------------------
 async def check_bot_admin_status(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -186,10 +261,16 @@ async def is_user_authorized(user_id: int, context: ContextTypes.DEFAULT_TYPE) -
     logger.info(f"User {user_id} authorized: {is_auth}")
     return is_auth
 
-async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> Tuple[int, str]:
+async def send_channel_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    media_type: Optional[str] = None,
+    media_file_id: Optional[str] = None
+) -> Tuple[int, str]:
     """Send a message to the channel with inline button."""
-    # Channel fixed message with fancy formatting
-    channel_message = (
+    # Channel header
+    channel_header = (
         "┏━━━━━◥◣◆◢◤━━━━━┓\n"
         "   ᯽ VIP -- ALI ᯽\n"
         "   ᯽ VIP -- BI GHAM ᯽\n"
@@ -201,18 +282,6 @@ async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYP
     unique_id = str(uuid.uuid4())
     logger.info(f"Generated unique_id: {unique_id}")
     
-    # Save text to database before creating button
-    save_success = await save_text_content(
-        unique_id=unique_id,
-        original_text=text,
-        user_id=update.effective_user.id,
-        channel_message_id=0
-    )
-    
-    if not save_success:
-        logger.error(f"Failed to save text content for unique_id: {unique_id}")
-        raise Exception("Failed to save text content")
-    
     # Create inline keyboard with Web App button
     webapp_url = f"{WEBAPP_URL}?text_id={unique_id}"
     keyboard = [[
@@ -223,19 +292,57 @@ async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYP
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Send message to channel
+    # Send message to channel based on media type
     try:
-        logger.info("Sending channel message...")
-        channel_msg = await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=channel_message,
-            reply_markup=reply_markup
-        )
+        logger.info(f"Sending channel message with media_type: {media_type}")
+        
+        if media_type == "photo" and media_file_id:
+            channel_msg = await context.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=media_file_id,
+                caption=channel_header,
+                reply_markup=reply_markup
+            )
+        elif media_type == "video" and media_file_id:
+            channel_msg = await context.bot.send_video(
+                chat_id=CHANNEL_ID,
+                video=media_file_id,
+                caption=channel_header,
+                reply_markup=reply_markup
+            )
+        elif media_type == "voice" and media_file_id:
+            channel_msg = await context.bot.send_voice(
+                chat_id=CHANNEL_ID,
+                voice=media_file_id,
+                caption=channel_header,
+                reply_markup=reply_markup
+            )
+        else:
+            # Text only
+            full_text = channel_header + "\n\n" + text
+            channel_msg = await context.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=full_text,
+                reply_markup=reply_markup
+            )
+        
         logger.info(f"Channel message sent successfully: {channel_msg.message_id}")
         
-        await update_channel_message_id(unique_id, channel_msg.message_id)
+        # Save text to database
+        save_success = await save_text_content(
+            unique_id=unique_id,
+            original_text=text,
+            user_id=update.effective_user.id,
+            channel_message_id=channel_msg.message_id,
+            media_type=media_type,
+            media_file_id=media_file_id
+        )
+        
+        if not save_success:
+            logger.error(f"Failed to save text content for unique_id: {unique_id}")
         
         return channel_msg.message_id, unique_id
+        
     except TelegramError as e:
         logger.exception(f"Failed to send message to channel: {e}")
         raise
@@ -255,11 +362,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         welcome_text = (
             f"👋 سلام {user.first_name}!\n\n"
             "ربات آماده است.\n"
-            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
+            "برای ارسال محتوا به کانال، روی دکمه زیر بزنید."
         )
         
         keyboard = [[
-            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+            InlineKeyboardButton("📤 ارسال محتوا", callback_data="send_text")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -298,16 +405,16 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         welcome_text = (
             f"👋 سلام {update.effective_user.first_name}!\n\n"
             "ربات آماده است.\n"
-            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
+            "برای ارسال محتوا به کانال، روی دکمه زیر بزنید."
         )
         
         keyboard = [[
-            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+            InlineKeyboardButton("📤 ارسال محتوا", callback_data="send_text")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "❌ ارسال متن لغو شد.\n\n" + welcome_text,
+            "❌ ارسال لغو شد.\n\n" + welcome_text,
             reply_markup=reply_markup
         )
     else:
@@ -356,11 +463,11 @@ async def handle_check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE)
         welcome_text = (
             "✅ تأیید شد.\n\n"
             "ربات آماده استفاده است.\n"
-            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
+            "برای ارسال محتوا به کانال، روی دکمه زیر بزنید."
         )
         
         keyboard = [[
-            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+            InlineKeyboardButton("📤 ارسال محتوا", callback_data="send_text")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -396,11 +503,11 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         welcome_text = (
             "✅ تأیید شد.\n\n"
             "ربات آماده استفاده است.\n"
-            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
+            "برای ارسال محتوا به کانال، روی دکمه زیر بزنید."
         )
         
         keyboard = [[
-            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+            InlineKeyboardButton("📤 ارسال محتوا", callback_data="send_text")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -418,7 +525,7 @@ async def handle_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Handle send text button click."""
     query = update.callback_query
     user_id = update.effective_user.id
-    logger.info(f"User {user_id} clicked send text")
+    logger.info(f"User {user_id} clicked send content")
     
     await query.answer()
     
@@ -441,11 +548,22 @@ async def handle_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
     
+    # Clear any previous pending data
+    context.user_data.clear()
     context.user_data['waiting_for_text'] = True
-    logger.info(f"User {user_id} entered text receiving mode")
+    context.user_data['media_type'] = None
+    context.user_data['media_file_id'] = None
+    
+    logger.info(f"User {user_id} entered content receiving mode")
     
     await query.edit_message_text(
-        "📝 لطفاً متن موردنظر خود را ارسال کنید."
+        "📤 لطفاً محتوای خود را ارسال کنید.\n\n"
+        "می‌توانید:\n"
+        "• متن\n"
+        "• عکس\n"
+        "• ویدیو\n"
+        "• ویس\n"
+        "ارسال کنید."
     )
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -458,6 +576,60 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "برای شروع مجدد از /start استفاده کنید."
     )
 
+async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle media messages (photo, video, voice)."""
+    user_id = update.effective_user.id
+    logger.info(f"Media received from user: {user_id}")
+    
+    if not context.user_data.get('waiting_for_text'):
+        # User is not in content receiving mode
+        if await is_user_authorized(user_id, context):
+            welcome_text = (
+                f"👋 سلام {update.effective_user.first_name}!\n\n"
+                "برای ارسال محتوا، ابتدا روی دکمه زیر بزنید."
+            )
+            keyboard = [[
+                InlineKeyboardButton("📤 ارسال محتوا", callback_data="send_text")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+        return
+    
+    media_type = None
+    media_file_id = None
+    
+    # Detect media type
+    if update.message.photo:
+        media_type = "photo"
+        media_file_id = update.message.photo[-1].file_id
+        logger.info(f"Photo received, file_id: {media_file_id[:20]}...")
+    elif update.message.video:
+        media_type = "video"
+        media_file_id = update.message.video.file_id
+        logger.info(f"Video received, file_id: {media_file_id[:20]}...")
+    elif update.message.voice:
+        media_type = "voice"
+        media_file_id = update.message.voice.file_id
+        logger.info(f"Voice received, file_id: {media_file_id[:20]}...")
+    else:
+        await update.message.reply_text(
+            "❌ نوع فایل پشتیبانی نمی‌شود.\n"
+            "لطفاً عکس، ویدیو یا ویس ارسال کنید."
+        )
+        return
+    
+    # Store media in user_data
+    context.user_data['media_type'] = media_type
+    context.user_data['media_file_id'] = media_file_id
+    
+    media_emoji = {"photo": "📷", "video": "🎥", "voice": "🎤"}
+    emoji = media_emoji.get(media_type, "📎")
+    
+    await update.message.reply_text(
+        f"✅ {emoji} {media_type} دریافت شد.\n\n"
+        "📝 حالا متن موردنظر را ارسال کنید."
+    )
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text messages from users."""
     user_id = update.effective_user.id
@@ -465,11 +637,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     logger.info(f"Text message received from user: {user_id}")
     
     if context.user_data.get('waiting_for_text'):
-        logger.info(f"User {user_id} is in text receiving mode")
+        logger.info(f"User {user_id} is in content receiving mode")
         logger.info(f"Text received: {text[:50]}...")
         
         if not await check_bot_admin_status(context):
-            context.user_data['waiting_for_text'] = False
+            context.user_data.clear()
             keyboard = [[
                 InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
             ]]
@@ -482,20 +654,27 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         
         try:
+            # Get pending media info
+            media_type = context.user_data.get('media_type')
+            media_file_id = context.user_data.get('media_file_id')
+            
             # Send message to channel
-            logger.info("Attempting to send message to channel...")
-            channel_msg_id, unique_id = await send_channel_message(update, context, text)
+            logger.info(f"Sending to channel with media_type: {media_type}")
+            channel_msg_id, unique_id = await send_channel_message(
+                update, context, text, media_type, media_file_id
+            )
             logger.info(f"Message sent to channel successfully: {channel_msg_id}, unique_id: {unique_id}")
             
-            context.user_data['waiting_for_text'] = False
+            # Clear user data
+            context.user_data.clear()
             
             success_text = (
-                "✅ متن شما با موفقیت در کانال منتشر شد.\n\n"
-                "برای ارسال متن جدید، روی دکمه زیر بزنید."
+                "✅ محتوای شما با موفقیت در کانال منتشر شد.\n\n"
+                "برای ارسال محتوای جدید، روی دکمه زیر بزنید."
             )
             
             keyboard = [[
-                InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+                InlineKeyboardButton("📤 ارسال محتوا", callback_data="send_text")
             ]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -506,14 +685,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             
         except TelegramError as e:
             logger.exception(f"Error sending message to channel: {e}")
-            context.user_data['waiting_for_text'] = False
+            context.user_data.clear()
             await update.message.reply_text(
-                f"❌ خطا در ارسال پیام به کانال: {str(e)}"
+                f"❌ خطا در ارسال به کانال: {str(e)}"
             )
         
         return
     
-    # If user is not in text receiving mode
+    # If user is not in content receiving mode
     if not await is_user_authorized(user_id, context):
         if not await check_bot_admin_status(context):
             keyboard = [[
@@ -530,10 +709,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             welcome_text = (
                 f"👋 سلام {update.effective_user.first_name}!\n\n"
                 "ربات آماده است.\n"
-                "برای ارسال متن به کانال، روی دکمه زیر بزنید."
+                "برای ارسال محتوا به کانال، روی دکمه زیر بزنید."
             )
             keyboard = [[
-                InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
+                InlineKeyboardButton("📤 ارسال محتوا", callback_data="send_text")
             ]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
@@ -543,11 +722,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
 async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle non-text messages."""
-    logger.info(f"Non-text message from user: {update.effective_user.id}")
+    """Handle non-text, non-media messages."""
+    logger.info(f"Unknown message from user: {update.effective_user.id}")
     await update.message.reply_text(
-        "❌ لطفاً فقط متن ارسال کنید.\n"
-        "ربات فعلاً فقط از ارسال متن پشتیبانی می‌کند."
+        "❌ لطفاً فقط متن، عکس، ویدیو یا ویس ارسال کنید."
     )
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -562,44 +740,15 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception:
         pass
 
-# -------------------- Web App Handler --------------------
-async def web_app_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Web App data from users."""
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    
-    try:
-        data = json.loads(query.data)
-        if data.get('action') == 'get_text':
-            text_id = data.get('text_id')
-            logger.info(f"WebApp requested text for ID: {text_id}")
-            
-            if text_id:
-                original_text = await get_text_content(text_id)
-                if original_text:
-                    logger.info(f"Text loaded from database for WebApp")
-                    await query.answer(
-                        text=original_text[:200] if len(original_text) > 200 else original_text,
-                        show_alert=True
-                    )
-                else:
-                    logger.warning(f"Text not found for WebApp ID: {text_id}")
-                    await query.answer("❌ متن یافت نشد.", show_alert=True)
-            else:
-                await query.answer("❌ شناسه متن نامعتبر.", show_alert=True)
-    except json.JSONDecodeError:
-        logger.warning(f"Invalid JSON from WebApp: {query.data}")
-    except Exception as e:
-        logger.exception(f"Error in web_app_handler: {e}")
-        await query.answer("❌ خطا در نمایش متن.", show_alert=True)
-
 # -------------------- Main Application --------------------
 async def main() -> None:
-    """Start the bot."""
+    """Start the bot and web server."""
     try:
         # Initialize database
         await init_db_pool()
+        
+        # Start web server
+        await start_web_server()
         
         # Create application
         application = Application.builder().token(BOT_TOKEN).build()
@@ -614,13 +763,12 @@ async def main() -> None:
         application.add_handler(CallbackQueryHandler(button_callback))
         logger.info("Callback handler added.")
         
-        # Add Web App handler
-        application.add_handler(CallbackQueryHandler(web_app_handler, pattern="^webapp_"))
-        logger.info("Web App handler added.")
-        
         # Add message handlers
+        application.add_handler(MessageHandler(filters.PHOTO, handle_media_message))
+        application.add_handler(MessageHandler(filters.VIDEO, handle_media_message))
+        application.add_handler(MessageHandler(filters.VOICE, handle_media_message))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-        application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_unknown_message))
+        application.add_handler(MessageHandler(~filters.TEXT & ~filters.PHOTO & ~filters.VIDEO & ~filters.VOICE, handle_unknown_message))
         logger.info("Message handlers added.")
         
         # Add error handler
@@ -629,23 +777,30 @@ async def main() -> None:
         
         logger.info("Starting bot...")
         
-        # Event loop handling for Python 3.14
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            logger.info("Event loop found.")
-        except RuntimeError:
-            logger.info("No event loop found, creating a new one...")
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
         # Start polling
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        
+        logger.info("Bot is running. Press Ctrl+C to stop.")
+        
+        # Keep the bot running
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.info("Shutting down...")
+        finally:
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
+            if db_pool:
+                await db_pool.close()
+            logger.info("Bot stopped.")
         
     except Exception as e:
         logger.exception(f"Fatal error in main: {e}")
         raise
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
