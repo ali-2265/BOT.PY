@@ -1,694 +1,317 @@
-# bot.py
-import os
-import logging
-import sqlite3
-import uuid
-from datetime import datetime
-from typing import Dict, Optional, Tuple
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
-from telegram.error import TelegramError
-
-# -------------------- Logging Setup --------------------
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# -------------------- Configuration --------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable not set!")
-
-CHANNEL_USERNAME = "@BI_GH_AM"
-CHANNEL_ID = CHANNEL_USERNAME
-
-# -------------------- Database Setup --------------------
-DB_PATH = "bot_data.db"
-
-def init_db():
-    """Initialize SQLite database with required tables."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Table to store user authorization status
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            is_authorized BOOLEAN DEFAULT 0,
-            first_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Table for storing text content with unique ID
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS text_contents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            unique_id TEXT NOT NULL UNIQUE,
-            original_text TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            channel_message_id INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized successfully.")
-
-def get_user(user_id: int) -> Optional[Dict]:
-    """Get user record from database."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT user_id, is_authorized FROM users WHERE user_id = ?", (user_id,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            return {"user_id": row[0], "is_authorized": bool(row[1])}
-        return None
-    except Exception as e:
-        logger.exception(f"Error getting user: {e}")
-        return None
-
-def create_or_update_user(user_id: int, is_authorized: bool = False) -> None:
-    """Create or update user in database."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO users (user_id, is_authorized) VALUES (?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET is_authorized = excluded.is_authorized",
-            (user_id, is_authorized)
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.exception(f"Error creating/updating user: {e}")
-
-def save_text_content(unique_id: str, original_text: str, user_id: int, channel_message_id: int) -> bool:
-    """Save text content with unique ID in database."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO text_contents (unique_id, original_text, user_id, channel_message_id) "
-            "VALUES (?, ?, ?, ?)",
-            (unique_id, original_text, user_id, channel_message_id)
-        )
-        conn.commit()
-        conn.close()
-        logger.info(f"Text saved with unique_id: {unique_id}")
-        return True
-    except Exception as e:
-        logger.exception(f"Error saving text content: {e}")
-        return False
-
-def get_text_content(unique_id: str) -> Optional[str]:
-    """Retrieve original text by unique ID."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT original_text FROM text_contents WHERE unique_id = ?", (unique_id,))
-        row = c.fetchone()
-        conn.close()
+<!DOCTYPE html>
+<html lang="fa">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>نمایش متن</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
         
-        if row:
-            logger.info(f"Text found in database for ID: {unique_id}")
-            return row[0]
-        else:
-            logger.warning(f"No text found in database for ID: {unique_id}")
-            return None
-    except Exception as e:
-        logger.exception(f"Database error in get_text_content: {e}")
-        return None
-
-def update_channel_message_id(unique_id: str, channel_message_id: int) -> bool:
-    """Update channel_message_id for a given unique_id."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "UPDATE text_contents SET channel_message_id = ? WHERE unique_id = ?",
-            (channel_message_id, unique_id)
-        )
-        conn.commit()
-        conn.close()
-        logger.info(f"Updated channel_message_id for unique_id: {unique_id}")
-        return True
-    except Exception as e:
-        logger.exception(f"Error updating channel_message_id: {e}")
-        return False
-
-# -------------------- Helper Functions --------------------
-async def check_bot_admin_status(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if the bot is an administrator in the channel."""
-    try:
-        bot_member = await context.bot.get_chat_member(
-            chat_id=CHANNEL_ID,
-            user_id=context.bot.id
-        )
-        is_admin = bot_member.status in ['administrator', 'creator']
-        logger.info(f"Bot admin status: {is_admin}")
-        return is_admin
-    except TelegramError as e:
-        logger.error(f"Error checking bot admin status: {e}")
-        return False
-
-async def is_user_authorized(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is authorized to post messages."""
-    if not await check_bot_admin_status(context):
-        return False
-    
-    user = get_user(user_id)
-    is_auth = user and user["is_authorized"]
-    logger.info(f"User {user_id} authorized: {is_auth}")
-    return is_auth
-
-async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> Tuple[int, str]:
-    """Send a message to the channel with inline button."""
-    # Channel fixed message with fancy formatting (NO user text here)
-    channel_message = (
-        "┏━━━━━◥◣◆◢◤━━━━━┓\n"
-        "   ᯽ VIP -- ALI ᯽\n"
-        "   ᯽ VIP -- BI GHAM ᯽\n"
-        "   ᯽ @BI_GH_AM ᯽\n"
-        "┗━━━━━◥◣◆◢◤━━━━━┛"
-    )
-    
-    # Generate unique ID for this text
-    unique_id = str(uuid.uuid4())
-    logger.info(f"Generated unique_id: {unique_id}")
-    
-    # Save text to database before creating button
-    save_success = save_text_content(
-        unique_id=unique_id,
-        original_text=text,
-        user_id=update.effective_user.id,
-        channel_message_id=0  # Will be updated after sending
-    )
-    
-    if not save_success:
-        logger.error(f"Failed to save text content for unique_id: {unique_id}")
-        raise Exception("Failed to save text content")
-    
-    # Create inline keyboard with ONLY ONE button (NO COPY BUTTON)
-    keyboard = [[
-        InlineKeyboardButton(
-            "𝐁𝐈 𝐆𝐇𝐀𝐌",
-            callback_data=f"show_{unique_id}"
-        )
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Send message to channel
-    try:
-        channel_msg = await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=channel_message,
-            reply_markup=reply_markup
-        )
-        logger.info(f"Channel message sent: {channel_msg.message_id}")
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e, #16213e);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            direction: rtl;
+        }
         
-        # Update channel_message_id in database
-        update_channel_message_id(unique_id, channel_msg.message_id)
+        .popup-container {
+            background: #2d2d44;
+            border-radius: 20px;
+            padding: 30px;
+            max-width: 500px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
         
-        return channel_msg.message_id, unique_id
-    except TelegramError as e:
-        logger.error(f"Error sending message to channel: {e}")
-        raise
-
-# -------------------- Handlers --------------------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command - Check bot admin status and show appropriate menu."""
-    user = update.effective_user
-    user_id = user.id
-    logger.info(f"Start command from user: {user_id}")
-    
-    # Check if bot is admin in channel
-    is_admin = await check_bot_admin_status(context)
-    
-    if is_admin:
-        # Bot is admin - show main menu
-        logger.info(f"Bot is admin, showing main menu to user {user_id}")
+        .popup-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 15px;
+        }
         
-        # Update user as authorized
-        create_or_update_user(user_id, True)
+        .popup-title {
+            color: #ffffff;
+            font-size: 18px;
+            font-weight: 600;
+        }
         
-        welcome_text = (
-            f"👋 سلام {user.first_name}!\n\n"
-            "ربات آماده است.\n"
-            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
-        )
+        .popup-body {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 20px;
+            min-height: 100px;
+            margin-bottom: 25px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
         
-        keyboard = [[
-            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        .popup-text {
+            color: #e0e0e0;
+            font-size: 16px;
+            line-height: 1.8;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            direction: ltr;
+            text-align: left;
+        }
         
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=reply_markup
-        )
-    else:
-        # Bot is not admin - ask user to add bot as admin
-        logger.info(f"Bot is not admin, asking user {user_id} to add bot as admin")
+        .popup-footer {
+            display: flex;
+            gap: 12px;
+            justify-content: flex-end;
+        }
         
-        create_or_update_user(user_id, False)
+        .btn {
+            padding: 12px 28px;
+            border: none;
+            border-radius: 12px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-family: inherit;
+        }
         
-        welcome_text = (
-            f"👋 سلام {user.first_name}!\n\n"
-            "❌ برای استفاده از ربات، ابتدا باید ربات را در کانال @BI_GH_AM به عنوان Administrator اضافه کنید."
-        )
+        .btn-copy {
+            background: #4CAF50;
+            color: #ffffff;
+        }
         
-        keyboard = [[
-            InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        .btn-copy:hover {
+            background: #45a049;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(76, 175, 80, 0.3);
+        }
         
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=reply_markup
-        )
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /cancel command."""
-    user_id = update.effective_user.id
-    logger.info(f"Cancel command from user: {user_id}")
-    
-    # Clear any user state
-    context.user_data.clear()
-    
-    # Check if bot is admin
-    is_admin = await check_bot_admin_status(context)
-    
-    if is_admin:
-        # Show main menu
-        welcome_text = (
-            f"👋 سلام {update.effective_user.first_name}!\n\n"
-            "ربات آماده است.\n"
-            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
-        )
+        .btn-ok {
+            background: #6c63ff;
+            color: #ffffff;
+        }
         
-        keyboard = [[
-            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        .btn-ok:hover {
+            background: #5a52d5;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(108, 99, 255, 0.3);
+        }
         
-        await update.message.reply_text(
-            "❌ ارسال متن لغو شد.\n\n" + welcome_text,
-            reply_markup=reply_markup
-        )
-    else:
-        await update.message.reply_text(
-            "❌ عملیات لغو شد.\n"
-            "برای شروع مجدد از /start استفاده کنید."
-        )
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle all callback queries."""
-    query = update.callback_query
-    logger.info(f"Callback received: {query.data} from user: {query.from_user.id}")
-    
-    # Handle "check_admin" callback
-    if query.data == "check_admin":
-        await handle_check_admin(update, context)
-        return
-    
-    # Handle "send_text" callback
-    if query.data == "send_text":
-        await handle_send_text(update, context)
-        return
-    
-    # Handle "show_text" callback (this is our main button)
-    if query.data.startswith("show_"):
-        await handle_show_text(update, context)
-        return
-    
-    # Handle "retry" callback
-    if query.data == "retry":
-        await handle_retry(update, context)
-        return
-    
-    # Handle "cancel" callback
-    if query.data == "cancel_operation":
-        await handle_cancel(update, context)
-        return
-    
-    logger.warning(f"Unknown callback: {query.data}")
-    await query.answer("❌ دستور نامعتبر.", show_alert=True)
-
-async def handle_check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle checking if bot is admin in channel."""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    logger.info(f"Check admin from user: {user_id}")
-    
-    # Answer the callback first
-    await query.answer()
-    
-    is_admin = await check_bot_admin_status(context)
-    
-    if is_admin:
-        # Bot is admin - authorize user and show main menu
-        create_or_update_user(user_id, True)
-        logger.info(f"User {user_id} authorized as admin")
+        .btn:active {
+            transform: translateY(0px);
+        }
         
-        welcome_text = (
-            "✅ تأیید شد.\n\n"
-            "ربات آماده استفاده است.\n"
-            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
-        )
+        .loading-text {
+            color: #8888aa;
+            text-align: center;
+            padding: 20px;
+        }
         
-        keyboard = [[
-            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        .error-text {
+            color: #ff6b6b;
+            text-align: center;
+            padding: 20px;
+        }
         
-        await query.edit_message_text(
-            welcome_text,
-            reply_markup=reply_markup
-        )
-    else:
-        # Bot is still not admin
-        keyboard = [[
-            InlineKeyboardButton("🔄 بررسی مجدد", callback_data="retry")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        .copy-success {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #4CAF50;
+            color: white;
+            padding: 12px 24px;
+            border-radius: 10px;
+            font-size: 14px;
+            opacity: 0;
+            transition: opacity 0.5s ease;
+            box-shadow: 0 5px 20px rgba(0, 0, 0, 0.3);
+        }
         
-        await query.edit_message_text(
-            "❌ ربات هنوز Administrator نشده است.\n"
-            "لطفاً ابتدا آن را در کانال ادمین کنید و دوباره تلاش کنید.",
-            reply_markup=reply_markup
-        )
-
-async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle retry button click."""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    logger.info(f"Retry from user: {user_id}")
-    
-    # Answer the callback first
-    await query.answer()
-    
-    is_admin = await check_bot_admin_status(context)
-    
-    if is_admin:
-        # Bot is admin - authorize user and show main menu
-        create_or_update_user(user_id, True)
-        logger.info(f"User {user_id} authorized via retry")
+        .copy-success.show {
+            opacity: 1;
+        }
         
-        welcome_text = (
-            "✅ تأیید شد.\n\n"
-            "ربات آماده استفاده است.\n"
-            "برای ارسال متن به کانال، روی دکمه زیر بزنید."
-        )
-        
-        keyboard = [[
-            InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            welcome_text,
-            reply_markup=reply_markup
-        )
-    else:
-        await query.edit_message_text(
-            "❌ ربات همچنان Administrator نیست.\n"
-            "لطفاً ابتدا ربات را در کانال ادمین کنید."
-        )
-
-async def handle_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle send text button click - Enter text receiving mode."""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    logger.info(f"Send text from user: {user_id}")
-    
-    # Answer the callback first
-    await query.answer()
-    
-    # Double check if bot is still admin
-    is_admin = await check_bot_admin_status(context)
-    
-    if not is_admin:
-        # Bot is no longer admin - show error
-        logger.warning(f"Bot is no longer admin when user {user_id} tried to send text")
-        
-        welcome_text = (
-            "❌ ربات دیگر Administrator نیست.\n"
-            "لطفاً مجدداً ربات را در کانال ادمین کنید."
-        )
-        
-        keyboard = [[
-            InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            welcome_text,
-            reply_markup=reply_markup
-        )
-        return
-    
-    # Bot is admin - enter text receiving mode
-    # Set user state to waiting for text
-    context.user_data['waiting_for_text'] = True
-    
-    await query.edit_message_text(
-        "📝 لطفاً متن موردنظر خود را ارسال کنید."
-    )
-
-async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle showing original text in popup when button is clicked."""
-    query = update.callback_query
-    callback_data = query.data
-    user_id = query.from_user.id
-    
-    # ========== LOG: BUTTON CLICK ==========
-    logger.info("========== BUTTON CLICK ==========")
-    logger.info(f"Callback data: {repr(callback_data)}")
-    logger.info(f"User ID: {user_id}")
-    
-    try:
-        if not callback_data.startswith("show_"):
-            logger.warning(f"Invalid callback format: {callback_data}")
-            await query.answer("❌ دستور نامعتبر.", show_alert=True)
-            return
-        
-        # Extract unique ID from callback data
-        unique_id = callback_data[5:]  # Remove "show_" prefix
-        logger.info(f"Text ID: {unique_id}")
-        
-        # Get the original text from database
-        original_text = get_text_content(unique_id)
-        logger.info(f"Original text found: {original_text is not None}")
-        
-        if original_text is None or original_text == "":
-            logger.error("Original text not found or empty")
-            await query.answer("❌ متن یافت نشد.", show_alert=True)
-            return
-        
-        logger.info(f"Original text length: {len(original_text)}")
-        logger.info("Showing original text in Telegram alert")
-        
-        # Check text length limit (Telegram allows max 200 chars for alerts)
-        if len(original_text) > 200:
-            # Truncate text to fit in alert
-            truncated_text = original_text[:197] + "..."
-            await query.answer(
-                text=f"📝 {truncated_text}\n\n⚠️ متن کامل در پیام کانال موجود است.",
-                show_alert=True
-            )
-            logger.info(f"Text truncated (was {len(original_text)} chars)")
-        else:
-            # Show full text in popup - THIS IS THE MAIN BEHAVIOR
-            await query.answer(
-                text=original_text,
-                show_alert=True
-            )
-            logger.info("Telegram alert sent successfully")
+        @media (max-width: 480px) {
+            .popup-container {
+                padding: 20px;
+                margin: 10px;
+            }
             
-    except Exception as e:
-        logger.exception("Callback error")
-        await query.answer("❌ خطا در نمایش متن.", show_alert=True)
-
-async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle cancel button from inline keyboard."""
-    query = update.callback_query
-    logger.info(f"Cancel from user: {query.from_user.id}")
-    await query.answer()
-    await query.edit_message_text(
-        "❌ عملیات لغو شد.\n"
-        "برای شروع مجدد از /start استفاده کنید."
-    )
-
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages from users."""
-    user_id = update.effective_user.id
-    text = update.message.text
-    logger.info(f"Text message from user: {user_id}, text: {text[:50]}...")
+            .popup-footer {
+                flex-direction: column;
+            }
+            
+            .btn {
+                width: 100%;
+                justify-content: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="popup-container">
+        <div class="popup-header">
+            <span class="popup-title">📝 متن اصلی</span>
+        </div>
+        
+        <div class="popup-body" id="textBody">
+            <div class="loading-text">⏳ در حال بارگذاری...</div>
+        </div>
+        
+        <div class="popup-footer">
+            <button class="btn btn-copy" id="copyBtn">📋 کپی</button>
+            <button class="btn btn-ok" id="okBtn">OK</button>
+        </div>
+    </div>
     
-    # Check if user is in text receiving mode
-    if context.user_data.get('waiting_for_text'):
-        logger.info(f"User {user_id} is in text receiving mode")
-        
-        # Check if bot is still admin
-        if not await check_bot_admin_status(context):
-            # Bot is no longer admin
-            context.user_data['waiting_for_text'] = False
-            keyboard = [[
-                InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
-            ]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                "❌ ربات دیگر Administrator نیست.\n"
-                "لطفاً مجدداً ربات را در کانال ادمین کنید.",
-                reply_markup=reply_markup
-            )
-            return
-        
-        # Try to send message to channel
-        try:
-            # Send message to channel
-            channel_msg_id, unique_id = await send_channel_message(update, context, text)
-            logger.info(f"Message sent to channel: {channel_msg_id}, unique_id: {unique_id}")
-            
-            # Clear text receiving mode
-            context.user_data['waiting_for_text'] = False
-            
-            # Show success message with main menu
-            success_text = (
-                "✅ متن شما با موفقیت در کانال منتشر شد.\n\n"
-                "برای ارسال متن جدید، روی دکمه زیر بزنید."
-            )
-            
-            keyboard = [[
-                InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
-            ]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(
-                success_text,
-                reply_markup=reply_markup
-            )
-            
-        except TelegramError as e:
-            logger.error(f"Error sending message: {e}")
-            context.user_data['waiting_for_text'] = False
-            await update.message.reply_text(
-                f"❌ خطا در ارسال پیام به کانال: {str(e)}"
-            )
-        
-        return
+    <div class="copy-success" id="copySuccess">✅ متن کپی شد!</div>
     
-    # If user is not in text receiving mode, check authorization
-    if not await is_user_authorized(user_id, context):
-        # Check if bot is admin
-        if not await check_bot_admin_status(context):
-            keyboard = [[
-                InlineKeyboardButton("✅ ربات را ادمین کردم", callback_data="check_admin")
-            ]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                "❌ ربات در کانال ادمین نیست.\n"
-                "لطفاً ابتدا ربات را در کانال ادمین کنید.",
-                reply_markup=reply_markup
-            )
-        else:
-            # User not authorized but bot is admin - show main menu
-            create_or_update_user(user_id, True)
-            welcome_text = (
-                f"👋 سلام {update.effective_user.first_name}!\n\n"
-                "ربات آماده است.\n"
-                "برای ارسال متن به کانال، روی دکمه زیر بزنید."
-            )
-            keyboard = [[
-                InlineKeyboardButton("📤 ارسال متن", callback_data="send_text")
-            ]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                welcome_text,
-                reply_markup=reply_markup
-            )
-        return
-
-async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle non-text messages."""
-    logger.info(f"Non-text message from user: {update.effective_user.id}")
-    await update.message.reply_text(
-        "❌ لطفاً فقط متن ارسال کنید.\n"
-        "ربات فعلاً فقط از ارسال متن پشتیبانی می‌کند."
-    )
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors in the bot."""
-    logger.error(f"Update {update} caused error {context.error}")
-    
-    try:
-        if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "⚠️ خطایی رخ داد. لطفاً دوباره تلاش کنید."
-            )
-    except Exception:
-        pass
-
-# -------------------- Main Application --------------------
-def main() -> None:
-    """Start the bot."""
-    try:
-        # Initialize database
-        init_db()
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script>
+        // Get Telegram Web App instance
+        const tg = window.Telegram.WebApp;
         
-        # Create application
-        application = Application.builder().token(BOT_TOKEN).build()
-        logger.info("Application created successfully.")
+        // Get text_id from URL parameters
+        const urlParams = new URLSearchParams(window.location.search);
+        const textId = urlParams.get('text_id');
         
-        # Add command handlers
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler("cancel", cancel_command))
-        logger.info("Command handlers added.")
+        // DOM elements
+        const textBody = document.getElementById('textBody');
+        const copyBtn = document.getElementById('copyBtn');
+        const okBtn = document.getElementById('okBtn');
+        const copySuccess = document.getElementById('copySuccess');
         
-        # Add callback query handler
-        application.add_handler(CallbackQueryHandler(button_callback))
-        logger.info("Callback handler added.")
+        // Show loading state
+        textBody.innerHTML = '<div class="loading-text">⏳ در حال بارگذاری...</div>';
         
-        # Add message handlers
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-        application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_unknown_message))
-        logger.info("Message handlers added.")
+        // Function to fetch text from database via bot
+        async function fetchText() {
+            if (!textId) {
+                textBody.innerHTML = '<div class="error-text">❌ خطا: شناسه متن یافت نشد.</div>';
+                return;
+            }
+            
+            try {
+                // Send request to bot through Telegram Web App
+                tg.sendData(JSON.stringify({
+                    action: 'get_text',
+                    text_id: textId
+                }));
+                
+                // Wait for response from bot
+                // The bot will send the text through the Web App
+                // This is handled by the bot's web_app_data handler
+                
+                // For now, we'll simulate receiving text
+                // In production, the bot sends text via web_app_data
+                // We'll use the Telegram Web App's onEvent to handle it
+                
+            } catch (error) {
+                console.error('Error fetching text:', error);
+                textBody.innerHTML = '<div class="error-text">❌ خطا در دریافت متن.</div>';
+            }
+        }
         
-        # Add error handler
-        application.add_error_handler(error_handler)
-        logger.info("Error handler added.")
+        // Handle data from bot
+        tg.onEvent('mainButtonClicked', function() {
+            // Handle main button if needed
+        });
         
-        logger.info("Starting bot...")
+        // Override the sendData response handling
+        // When bot sends data back, we show it
+        const originalSendData = tg.sendData;
+        tg.sendData = function(data) {
+            try {
+                const parsed = JSON.parse(data);
+                if (parsed.action === 'get_text') {
+                    // This is our request, bot will respond
+                    console.log('Request sent for text:', parsed.text_id);
+                }
+            } catch (e) {
+                console.error('Error parsing sendData:', e);
+            }
+            // Store the callback for bot response
+            window._pendingCallback = function(response) {
+                try {
+                    const data = JSON.parse(response);
+                    if (data.text) {
+                        displayText(data.text);
+                    } else if (data.error) {
+                        textBody.innerHTML = `<div class="error-text">❌ ${data.error}</div>`;
+                    }
+                } catch (e) {
+                    console.error('Error parsing response:', e);
+                    textBody.innerHTML = '<div class="error-text">❌ خطا در نمایش متن.</div>';
+                }
+            };
+            return originalSendData.call(this, data);
+        };
         
-        # Event loop handling for Python 3.14
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            logger.info("Event loop found.")
-        except RuntimeError:
-            logger.info("No event loop found, creating a new one...")
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        // Function to display text
+        function displayText(text) {
+            if (text && text.trim() !== '') {
+                textBody.innerHTML = `<div class="popup-text">${escapeHtml(text)}</div>`;
+            } else {
+                textBody.innerHTML = '<div class="error-text">❌ متن خالی است.</div>';
+            }
+        }
         
-        # Start polling
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        // Escape HTML to prevent XSS
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
         
-    except Exception as e:
-        logger.exception(f"Fatal error in main: {e}")
-        raise
-
-if __name__ == "__main__":
-    main()
+        // Copy button handler
+        copyBtn.addEventListener('click', function() {
+            const textElement = document.querySelector('.popup-text');
+            if (textElement) {
+                const text = textElement.textContent;
+                navigator.clipboard.writeText(text).then(() => {
+                    // Show success message
+                    copySuccess.classList.add('show');
+                    setTimeout(() => {
+                        copySuccess.classList.remove('show');
+                    }, 2000);
+                    
+                    // Haptic feedback if available
+                    if (tg.HapticFeedback) {
+                        tg.HapticFeedback.notificationOccurred('success');
+                    }
+                }).catch(err => {
+                    console.error('Failed to copy:', err);
+                    if (tg.HapticFeedback) {
+                        tg.HapticFeedback.notificationOccurred('error');
+                    }
+                });
+            }
+        });
+        
+        // OK button handler - close popup
+        okBtn.addEventListener('click', function() {
+            tg.close();
+        });
+        
+        // Initialize - request text from bot
+        fetchText();
+        
+        // Ready the Web App
+        tg.ready();
+        
+        // Expand the Web App
+        tg.expand();
+        
+        console.log('Web App loaded. Text ID:', textId);
+    </script>
+</body>
+</html>
