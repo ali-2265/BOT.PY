@@ -278,15 +278,30 @@ async def send_channel_message(
     unique_id = str(uuid.uuid4())
     logger.info(f"Generated unique_id: {unique_id}")
     
-    webapp_url = f"{WEBAPP_URL}?text_id={unique_id}"
+    # Save text to database before creating button
+    save_success = await save_text_content(
+        unique_id=unique_id,
+        original_text=text,
+        user_id=update.effective_user.id,
+        channel_message_id=0
+    )
+    
+    if not save_success:
+        logger.error(f"Failed to save text content for unique_id: {unique_id}")
+        raise Exception("Failed to save text content")
+    
+    # ========== اصلاح: استفاده از callback_data به جای web_app ==========
+    # چون دکمه web_app در کانال پشتیبانی نمی‌شود
     keyboard = [[
         InlineKeyboardButton(
             "𝐁𝐈 𝐆𝐇𝐀𝐌",
-            web_app=WebAppInfo(url=webapp_url)
+            callback_data=f"show_{unique_id}"
         )
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    # ==================================================================
     
+    # Send message to channel based on media type
     try:
         logger.info(f"Sending channel message with media_type: {media_type}")
         
@@ -321,17 +336,8 @@ async def send_channel_message(
         
         logger.info(f"Channel message sent successfully: {channel_msg.message_id}")
         
-        save_success = await save_text_content(
-            unique_id=unique_id,
-            original_text=text,
-            user_id=update.effective_user.id,
-            channel_message_id=channel_msg.message_id,
-            media_type=media_type,
-            media_file_id=media_file_id
-        )
-        
-        if not save_success:
-            logger.error(f"Failed to save text content for unique_id: {unique_id}")
+        # Update channel_message_id in database
+        await update_channel_message_id(unique_id, channel_msg.message_id)
         
         return channel_msg.message_id, unique_id
         
@@ -419,6 +425,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Handle all callback queries."""
     query = update.callback_query
     logger.info(f"Callback received: {query.data} from user: {query.from_user.id}")
+    
+    # ========== شرط جدید برای نمایش متن ==========
+    if query.data.startswith("show_"):
+        await handle_show_text(update, context)
+        return
+    # ============================================
     
     if query.data == "check_admin":
         await handle_check_admin(update, context)
@@ -556,6 +568,54 @@ async def handle_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "• ویس\n"
         "ارسال کنید."
     )
+
+# ========== تابع جدید برای نمایش متن ==========
+async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle showing original text in popup when button is clicked."""
+    query = update.callback_query
+    callback_data = query.data
+    user_id = query.from_user.id
+    
+    logger.info("========== BUTTON CLICK ==========")
+    logger.info(f"Callback data: {repr(callback_data)}")
+    logger.info(f"User ID: {user_id}")
+    
+    try:
+        if not callback_data.startswith("show_"):
+            logger.warning(f"Invalid callback format: {callback_data}")
+            await query.answer("❌ دستور نامعتبر.", show_alert=True)
+            return
+        
+        unique_id = callback_data[5:]
+        logger.info(f"Extracted text ID: {unique_id}")
+        
+        text_data = await get_text_content(unique_id)
+        
+        if text_data and text_data.get("original_text"):
+            original_text = text_data["original_text"]
+            logger.info(f"Original text length: {len(original_text)}")
+            
+            if len(original_text) > 200:
+                truncated_text = original_text[:197] + "..."
+                await query.answer(
+                    text=f"📝 {truncated_text}\n\n⚠️ متن کامل در پیام کانال موجود است.",
+                    show_alert=True
+                )
+                logger.info(f"Text truncated (was {len(original_text)} chars)")
+            else:
+                await query.answer(
+                    text=f"📝 {original_text}",
+                    show_alert=True
+                )
+                logger.info("Telegram alert sent successfully")
+        else:
+            logger.error("Original text not found")
+            await query.answer("❌ متن یافت نشد.", show_alert=True)
+            
+    except Exception as e:
+        logger.exception(f"Error in handle_show_text: {e}")
+        await query.answer("❌ خطا در نمایش متن.", show_alert=True)
+# ==============================================
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle cancel button from inline keyboard."""
