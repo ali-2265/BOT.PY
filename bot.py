@@ -1,9 +1,9 @@
 # bot.py
 import os
 import logging
-import sqlite3
 import uuid
 import json
+import asyncpg
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
@@ -30,125 +30,133 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set!")
 
-# Web App URL - باید بعد از Deploy در Render تنظیم شود
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-app.onrender.com/webapp/")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable not set!")
 
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-app.onrender.com/webapp/")
 CHANNEL_USERNAME = "@BI_GH_AM"
 CHANNEL_ID = CHANNEL_USERNAME
 
-# -------------------- Database Setup --------------------
-DB_PATH = "bot_data.db"
+# -------------------- Database Connection --------------------
+db_pool = None
 
-def init_db():
-    """Initialize SQLite database with required tables."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Table to store user authorization status
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            is_authorized BOOLEAN DEFAULT 0,
-            first_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Table for storing text content with unique ID
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS text_contents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            unique_id TEXT NOT NULL UNIQUE,
-            original_text TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            channel_message_id INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized successfully.")
+async def init_db_pool():
+    """Initialize PostgreSQL connection pool."""
+    global db_pool
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        logger.info("Database connected successfully.")
+        
+        # Create tables if they don't exist
+        async with db_pool.acquire() as conn:
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    is_authorized BOOLEAN DEFAULT FALSE,
+                    first_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS text_contents (
+                    id SERIAL PRIMARY KEY,
+                    unique_id TEXT UNIQUE NOT NULL,
+                    original_text TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    channel_message_id BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            logger.info("Database tables initialized successfully.")
+    except Exception as e:
+        logger.exception(f"Failed to connect to database: {e}")
+        raise
 
-def get_user(user_id: int) -> Optional[Dict]:
+async def get_db_pool():
+    """Get database connection pool."""
+    global db_pool
+    if db_pool is None:
+        await init_db_pool()
+    return db_pool
+
+# -------------------- Database Functions --------------------
+async def get_user(user_id: int) -> Optional[Dict]:
     """Get user record from database."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT user_id, is_authorized FROM users WHERE user_id = ?", (user_id,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            return {"user_id": row[0], "is_authorized": bool(row[1])}
-        return None
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id, is_authorized FROM users WHERE user_id = $1",
+                user_id
+            )
+            if row:
+                return {"user_id": row[0], "is_authorized": row[1]}
+            return None
     except Exception as e:
         logger.exception(f"Error getting user: {e}")
         return None
 
-def create_or_update_user(user_id: int, is_authorized: bool = False) -> None:
+async def create_or_update_user(user_id: int, is_authorized: bool = False) -> None:
     """Create or update user in database."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO users (user_id, is_authorized) VALUES (?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET is_authorized = excluded.is_authorized",
-            (user_id, is_authorized)
-        )
-        conn.commit()
-        conn.close()
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (user_id, is_authorized) VALUES ($1, $2) "
+                "ON CONFLICT (user_id) DO UPDATE SET is_authorized = EXCLUDED.is_authorized",
+                user_id, is_authorized
+            )
     except Exception as e:
         logger.exception(f"Error creating/updating user: {e}")
 
-def save_text_content(unique_id: str, original_text: str, user_id: int, channel_message_id: int) -> bool:
+async def save_text_content(unique_id: str, original_text: str, user_id: int, channel_message_id: int) -> bool:
     """Save text content with unique ID in database."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO text_contents (unique_id, original_text, user_id, channel_message_id) "
-            "VALUES (?, ?, ?, ?)",
-            (unique_id, original_text, user_id, channel_message_id)
-        )
-        conn.commit()
-        conn.close()
-        logger.info(f"Text saved with unique_id: {unique_id}")
-        return True
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO text_contents (unique_id, original_text, user_id, channel_message_id) "
+                "VALUES ($1, $2, $3, $4)",
+                unique_id, original_text, user_id, channel_message_id
+            )
+            logger.info(f"Text saved with unique_id: {unique_id}")
+            return True
     except Exception as e:
         logger.exception(f"Error saving text content: {e}")
         return False
 
-def get_text_content(unique_id: str) -> Optional[str]:
+async def get_text_content(unique_id: str) -> Optional[str]:
     """Retrieve original text by unique ID."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT original_text FROM text_contents WHERE unique_id = ?", (unique_id,))
-        row = c.fetchone()
-        conn.close()
-        
-        if row:
-            logger.info(f"Text found in database for ID: {unique_id}")
-            return row[0]
-        else:
-            logger.warning(f"No text found in database for ID: {unique_id}")
-            return None
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT original_text FROM text_contents WHERE unique_id = $1",
+                unique_id
+            )
+            if row:
+                logger.info(f"Text found in database for ID: {unique_id}")
+                return row[0]
+            else:
+                logger.warning(f"No text found in database for ID: {unique_id}")
+                return None
     except Exception as e:
         logger.exception(f"Database error in get_text_content: {e}")
         return None
 
-def update_channel_message_id(unique_id: str, channel_message_id: int) -> bool:
+async def update_channel_message_id(unique_id: str, channel_message_id: int) -> bool:
     """Update channel_message_id for a given unique_id."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "UPDATE text_contents SET channel_message_id = ? WHERE unique_id = ?",
-            (channel_message_id, unique_id)
-        )
-        conn.commit()
-        conn.close()
-        logger.info(f"Updated channel_message_id for unique_id: {unique_id}")
-        return True
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE text_contents SET channel_message_id = $1 WHERE unique_id = $2",
+                channel_message_id, unique_id
+            )
+            logger.info(f"Updated channel_message_id for unique_id: {unique_id}")
+            return True
     except Exception as e:
         logger.exception(f"Error updating channel_message_id: {e}")
         return False
@@ -173,7 +181,7 @@ async def is_user_authorized(user_id: int, context: ContextTypes.DEFAULT_TYPE) -
     if not await check_bot_admin_status(context):
         return False
     
-    user = get_user(user_id)
+    user = await get_user(user_id)
     is_auth = user and user["is_authorized"]
     logger.info(f"User {user_id} authorized: {is_auth}")
     return is_auth
@@ -194,7 +202,7 @@ async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYP
     logger.info(f"Generated unique_id: {unique_id}")
     
     # Save text to database before creating button
-    save_success = save_text_content(
+    save_success = await save_text_content(
         unique_id=unique_id,
         original_text=text,
         user_id=update.effective_user.id,
@@ -217,18 +225,19 @@ async def send_channel_message(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Send message to channel
     try:
+        logger.info("Sending channel message...")
         channel_msg = await context.bot.send_message(
             chat_id=CHANNEL_ID,
             text=channel_message,
             reply_markup=reply_markup
         )
-        logger.info(f"Channel message sent: {channel_msg.message_id}")
+        logger.info(f"Channel message sent successfully: {channel_msg.message_id}")
         
-        update_channel_message_id(unique_id, channel_msg.message_id)
+        await update_channel_message_id(unique_id, channel_msg.message_id)
         
         return channel_msg.message_id, unique_id
     except TelegramError as e:
-        logger.error(f"Error sending message to channel: {e}")
+        logger.exception(f"Failed to send message to channel: {e}")
         raise
 
 # -------------------- Handlers --------------------
@@ -241,7 +250,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     is_admin = await check_bot_admin_status(context)
     
     if is_admin:
-        create_or_update_user(user_id, True)
+        await create_or_update_user(user_id, True)
         
         welcome_text = (
             f"👋 سلام {user.first_name}!\n\n"
@@ -259,7 +268,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=reply_markup
         )
     else:
-        create_or_update_user(user_id, False)
+        await create_or_update_user(user_id, False)
         
         welcome_text = (
             f"👋 سلام {user.first_name}!\n\n"
@@ -342,7 +351,7 @@ async def handle_check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE)
     is_admin = await check_bot_admin_status(context)
     
     if is_admin:
-        create_or_update_user(user_id, True)
+        await create_or_update_user(user_id, True)
         
         welcome_text = (
             "✅ تأیید شد.\n\n"
@@ -382,7 +391,7 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     is_admin = await check_bot_admin_status(context)
     
     if is_admin:
-        create_or_update_user(user_id, True)
+        await create_or_update_user(user_id, True)
         
         welcome_text = (
             "✅ تأیید شد.\n\n"
@@ -409,7 +418,7 @@ async def handle_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Handle send text button click."""
     query = update.callback_query
     user_id = update.effective_user.id
-    logger.info(f"Send text from user: {user_id}")
+    logger.info(f"User {user_id} clicked send text")
     
     await query.answer()
     
@@ -433,6 +442,7 @@ async def handle_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     
     context.user_data['waiting_for_text'] = True
+    logger.info(f"User {user_id} entered text receiving mode")
     
     await query.edit_message_text(
         "📝 لطفاً متن موردنظر خود را ارسال کنید."
@@ -452,10 +462,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Handle text messages from users."""
     user_id = update.effective_user.id
     text = update.message.text
-    logger.info(f"Text message from user: {user_id}")
+    logger.info(f"Text message received from user: {user_id}")
     
     if context.user_data.get('waiting_for_text'):
         logger.info(f"User {user_id} is in text receiving mode")
+        logger.info(f"Text received: {text[:50]}...")
         
         if not await check_bot_admin_status(context):
             context.user_data['waiting_for_text'] = False
@@ -471,8 +482,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         
         try:
+            # Send message to channel
+            logger.info("Attempting to send message to channel...")
             channel_msg_id, unique_id = await send_channel_message(update, context, text)
-            logger.info(f"Message sent to channel: {channel_msg_id}, unique_id: {unique_id}")
+            logger.info(f"Message sent to channel successfully: {channel_msg_id}, unique_id: {unique_id}")
             
             context.user_data['waiting_for_text'] = False
             
@@ -492,7 +505,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             
         except TelegramError as e:
-            logger.error(f"Error sending message: {e}")
+            logger.exception(f"Error sending message to channel: {e}")
             context.user_data['waiting_for_text'] = False
             await update.message.reply_text(
                 f"❌ خطا در ارسال پیام به کانال: {str(e)}"
@@ -500,6 +513,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         return
     
+    # If user is not in text receiving mode
     if not await is_user_authorized(user_id, context):
         if not await check_bot_admin_status(context):
             keyboard = [[
@@ -512,7 +526,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=reply_markup
             )
         else:
-            create_or_update_user(user_id, True)
+            await create_or_update_user(user_id, True)
             welcome_text = (
                 f"👋 سلام {update.effective_user.first_name}!\n\n"
                 "ربات آماده است.\n"
@@ -548,31 +562,74 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception:
         pass
 
+# -------------------- Web App Handler --------------------
+async def web_app_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Web App data from users."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    
+    try:
+        data = json.loads(query.data)
+        if data.get('action') == 'get_text':
+            text_id = data.get('text_id')
+            logger.info(f"WebApp requested text for ID: {text_id}")
+            
+            if text_id:
+                original_text = await get_text_content(text_id)
+                if original_text:
+                    logger.info(f"Text loaded from database for WebApp")
+                    await query.answer(
+                        text=original_text[:200] if len(original_text) > 200 else original_text,
+                        show_alert=True
+                    )
+                else:
+                    logger.warning(f"Text not found for WebApp ID: {text_id}")
+                    await query.answer("❌ متن یافت نشد.", show_alert=True)
+            else:
+                await query.answer("❌ شناسه متن نامعتبر.", show_alert=True)
+    except json.JSONDecodeError:
+        logger.warning(f"Invalid JSON from WebApp: {query.data}")
+    except Exception as e:
+        logger.exception(f"Error in web_app_handler: {e}")
+        await query.answer("❌ خطا در نمایش متن.", show_alert=True)
+
 # -------------------- Main Application --------------------
-def main() -> None:
+async def main() -> None:
     """Start the bot."""
     try:
-        init_db()
+        # Initialize database
+        await init_db_pool()
         
+        # Create application
         application = Application.builder().token(BOT_TOKEN).build()
         logger.info("Application created successfully.")
         
+        # Add command handlers
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("cancel", cancel_command))
         logger.info("Command handlers added.")
         
+        # Add callback query handler
         application.add_handler(CallbackQueryHandler(button_callback))
         logger.info("Callback handler added.")
         
+        # Add Web App handler
+        application.add_handler(CallbackQueryHandler(web_app_handler, pattern="^webapp_"))
+        logger.info("Web App handler added.")
+        
+        # Add message handlers
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
         application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_unknown_message))
         logger.info("Message handlers added.")
         
+        # Add error handler
         application.add_error_handler(error_handler)
         logger.info("Error handler added.")
         
         logger.info("Starting bot...")
         
+        # Event loop handling for Python 3.14
         import asyncio
         try:
             loop = asyncio.get_event_loop()
@@ -582,6 +639,7 @@ def main() -> None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
         
+        # Start polling
         application.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
@@ -589,4 +647,5 @@ def main() -> None:
         raise
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
