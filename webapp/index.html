@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="fa">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>نمایش متن</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="popup-container">
+        <div class="popup-header">
+            <span class="popup-title">📝 متن اصلی</span>
+        </div>
+        
+        <div class="popup-body" id="textBody">
+            <div class="loading-text">⏳ در حال بارگذاری...</div>
+        </div>
+        
+        <div class="popup-footer">
+            <button class="btn btn-copy" id="copyBtn">📋 کپی</button>
+            <button class="btn btn-ok" id="okBtn">OK</button>
+        </div>
+    </div>
+    
+    <div class="copy-success" id="copySuccess">✅ متن کپی شد!</div>
+    
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
