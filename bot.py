@@ -323,14 +323,11 @@ async def send_channel_message(
                 reply_markup=reply_markup
             )
         else:
-            # ========== اصلاح: فقط متن کاربر، بدون Header ==========
-            # Text only - send only the user's text without the header
             channel_msg = await context.bot.send_message(
                 chat_id=CHANNEL_ID,
-                text=text,  # فقط متن کاربر
+                text=channel_header,
                 reply_markup=reply_markup
             )
-            # ========================================================
         
         logger.info(f"Channel message sent successfully: {channel_msg.message_id}")
         
@@ -424,11 +421,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     logger.info(f"Callback received: {query.data} from user: {query.from_user.id}")
     
-    # ========== شرط جدید برای نمایش متن ==========
     if query.data.startswith("show_"):
         await handle_show_text(update, context)
         return
-    # ============================================
     
     if query.data == "check_admin":
         await handle_check_admin(update, context)
@@ -567,7 +562,6 @@ async def handle_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "ارسال کنید."
     )
 
-# ========== تابع جدید برای نمایش متن ==========
 async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle showing original text in popup when button is clicked."""
     query = update.callback_query
@@ -596,13 +590,13 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if len(original_text) > 200:
                 truncated_text = original_text[:197] + "..."
                 await query.answer(
-                    text=f"📝 {truncated_text}\n\n⚠️ متن کامل در پیام کانال موجود است.",
+                    text=f"{truncated_text}\n\n⚠️ متن کامل در پیام کانال موجود است.",
                     show_alert=True
                 )
                 logger.info(f"Text truncated (was {len(original_text)} chars)")
             else:
                 await query.answer(
-                    text=f"📝 {original_text}",
+                    text=original_text,
                     show_alert=True
                 )
                 logger.info("Telegram alert sent successfully")
@@ -613,7 +607,6 @@ async def handle_show_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception as e:
         logger.exception(f"Error in handle_show_text: {e}")
         await query.answer("❌ خطا در نمایش متن.", show_alert=True)
-# ==============================================
 
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle cancel button from inline keyboard."""
